@@ -1,15 +1,5 @@
-use futures_util::StreamExt;
 use reqwest::Client;
 use std::time::Instant;
-
-const MAX_RESPONSE_BYTES: usize = 128 * 1024; // 128 KB limit for HTML title parsing
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SchemeStrategy {
-    HttpsFirst,
-    HttpsOnly,
-    BothParallel,
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
@@ -17,6 +7,17 @@ pub struct ScanResult {
     pub title: Option<String>,
     pub server: Option<String>,
     pub rtt_ms: Option<u64>,
+    pub headers: reqwest::header::HeaderMap,
+    pub body_snippet: String,
+}
+
+const MAX_RESPONSE_BYTES: usize = 128 * 1024; // 128 KB limit
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchemeStrategy {
+    HttpsFirst,
+    HttpsOnly,
+    BothParallel,
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -42,18 +43,20 @@ fn extract_title(html: &str) -> Option<String> {
 }
 
 pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> {
+    use futures_util::StreamExt;
+
     let start = Instant::now();
     let response = client.get(url).send().await.ok()?;
     let rtt_ms = start.elapsed().as_millis() as u64;
 
     let status_code = Some(response.status().as_u16());
-    let server = response
-        .headers()
+    let headers = response.headers().clone();
+    let server = headers
         .get("server")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Stream response body up to MAX_RESPONSE_BYTES limit
+    // Stream response body up to MAX_RESPONSE_BYTES
     let mut body_bytes = Vec::new();
     let mut stream = response.bytes_stream();
 
@@ -70,7 +73,7 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
         }
     }
 
-    let body_str = String::from_utf8_lossy(&body_bytes);
+    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
     let title = extract_title(&body_str);
 
     Some(ScanResult {
@@ -78,6 +81,8 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
         title,
         server,
         rtt_ms: Some(rtt_ms),
+        headers,
+        body_snippet: body_str,
     })
 }
 

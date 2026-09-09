@@ -147,6 +147,40 @@ impl TlsRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TechnologyObservation {
+    pub id: Uuid,
+    pub scan_id: Uuid,
+    pub endpoint_url: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl TechnologyObservation {
+    pub fn new(
+        scan_id: Uuid,
+        endpoint_url: String,
+        name: String,
+        version: Option<String>,
+        confidence: f32,
+        evidence: Vec<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            scan_id,
+            endpoint_url,
+            name,
+            version,
+            confidence,
+            evidence,
+            observed_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpObservation {
     pub id: Uuid,
     pub scan_id: Uuid,

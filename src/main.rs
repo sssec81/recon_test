@@ -2,6 +2,7 @@ mod crtsh;
 mod db;
 mod dns;
 mod exporter;
+mod fingerprint;
 mod models;
 mod normalize;
 mod pipeline;
@@ -12,7 +13,10 @@ mod tls;
 
 use clap::Parser;
 use dns::AsyncDnsResolver;
-use models::{DiscoverySource, Hostname, HttpObservation, ScanRun, ServiceRecord, TlsRecord};
+use models::{
+    DiscoverySource, Hostname, HttpObservation, ScanRun, ServiceRecord, TechnologyObservation,
+    TlsRecord,
+};
 use pipeline::{ReconEvent, Scheduler, WorkItem};
 use scanner::SchemeStrategy;
 use scope::ScopePolicy;
@@ -23,9 +27,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Engine v0.8.0
+/// Async Bug Bounty Subdomain Recon Engine v0.9.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.8.0", about = "Async Rust Recon Engine with TCP Service Port Scanner & TLS SAN Feedback Loop")]
+#[command(author, version = "0.9.0", about = "Async Rust Recon Engine with Tech & WAF Fingerprinting (Confidence & Evidence Scoring)")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -81,7 +85,7 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.8.0...");
+    println!("🚀 Starting Async Recon Engine v0.9.0...");
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
@@ -95,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.8.0")
+        .user_agent("recon_test/0.9.0")
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -143,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 6. Create ScanRun session
-    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.8.0".to_string());
+    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.9.0".to_string());
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
@@ -211,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             dns_records: Vec::new(),
                             services: Vec::new(),
                             tls_record: None,
+                            technologies: Vec::new(),
                             http_observation: dummy_http,
                         },
                     );
@@ -241,6 +246,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bundle.tls_record = Some(tls_record);
                     }
                 }
+                ReconEvent::TechnologyDetected { hostname, technologies } => {
+                    let name = hostname.as_str().to_string();
+                    if let Some(bundle) = pending_bundles.get_mut(&name) {
+                        bundle.technologies.extend(technologies);
+                    }
+                }
                 ReconEvent::HttpObserved(obs) => {
                     let status_str = obs
                         .status_code
@@ -259,12 +270,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|r| format!("{}ms", r))
                         .unwrap_or_else(|| "N/A".to_string());
 
+                    let name = obs.hostname.clone();
+                    let tech_summary = if let Some(bundle) = pending_bundles.get(&name) {
+                        if !bundle.technologies.is_empty() {
+                            let tech_names: Vec<String> = bundle
+                                .technologies
+                                .iter()
+                                .map(|t| format!("{} ({}%)", t.name, (t.confidence * 100.0) as u32))
+                                .collect();
+                            format!(" | Tech: {}", tech_names.join(", "))
+                        } else {
+                            "".to_string()
+                        }
+                    } else {
+                        "".to_string()
+                    };
+
                     println!(
-                        "  [{:<3}] {:<32} | RTT: {:<6} | Server: {:<12} | Title: {}",
-                        status_str, obs.hostname, rtt_str, server_str, title_str
+                        "  [{:<3}] {:<32} | RTT: {:<6} | Server: {:<12} | Title: {}{}",
+                        status_str, obs.hostname, rtt_str, server_str, title_str, tech_summary
                     );
 
-                    let name = obs.hostname.clone();
                     if let Some(mut bundle) = pending_bundles.remove(&name) {
                         bundle.http_observation = obs;
                         let _ = db_channel.send(bundle).await;
@@ -275,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             dns_records: Vec::new(),
                             services: Vec::new(),
                             tls_record: None,
+                            technologies: Vec::new(),
                             http_observation: obs,
                         };
                         let _ = db_channel.send(bundle).await;
@@ -309,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .await;
 
-                    // Resolve multi-record DNS asynchronously
+                    // Resolve multi-record DNS
                     let dns_records = resolver.resolve_all(hostname.as_str()).await;
                     let _ = bus
                         .send(ReconEvent::DnsResolved {
@@ -361,10 +388,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Perform HTTP Probe & emit HttpObserved event
+                    // Perform HTTP Probe
                     let scan = scanner::probe_subdomain(&client, hostname.as_str(), strategy).await;
 
+                    // Technology Fingerprinting with Confidence & Evidence
                     let url = format!("https://{}", hostname.as_str());
+                    let status = scan.status_code.unwrap_or(0);
+                    let raw_detections = fingerprint::fingerprint_tech(&scan.headers, &scan.body_snippet, status);
+
+                    let tech_observations: Vec<TechnologyObservation> = raw_detections
+                        .into_iter()
+                        .map(|d| {
+                            TechnologyObservation::new(
+                                scan_id,
+                                url.clone(),
+                                d.name,
+                                d.version,
+                                d.confidence,
+                                d.evidence,
+                            )
+                        })
+                        .collect();
+
+                    if !tech_observations.is_empty() {
+                        let _ = bus
+                            .send(ReconEvent::TechnologyDetected {
+                                hostname: hostname.clone(),
+                                technologies: tech_observations,
+                            })
+                            .await;
+                    }
+
                     let http_obs = HttpObservation::new(
                         scan_id,
                         hostname.as_str().to_string(),

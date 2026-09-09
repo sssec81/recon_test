@@ -1,4 +1,6 @@
-use crate::models::{DiscoverySource, DnsRecord, HttpObservation, ServiceRecord, TlsRecord};
+use crate::models::{
+    DiscoverySource, DnsRecord, HttpObservation, ServiceRecord, TechnologyObservation, TlsRecord,
+};
 use crate::normalize::NormalizedHostname;
 use crate::scope::ScopePolicy;
 use std::collections::HashSet;
@@ -30,6 +32,10 @@ pub enum ReconEvent {
     TlsObserved {
         hostname: NormalizedHostname,
         tls_record: TlsRecord,
+    },
+    TechnologyDetected {
+        hostname: NormalizedHostname,
+        technologies: Vec<TechnologyObservation>,
     },
     HttpObserved(HttpObservation),
 }

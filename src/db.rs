@@ -1,5 +1,5 @@
 use crate::models::{
-    DnsRecord, Hostname, HttpObservation, ScanRun, ServiceRecord, TlsRecord,
+    DnsRecord, Hostname, HttpObservation, ScanRun, ServiceRecord, TechnologyObservation, TlsRecord,
 };
 use rusqlite::{params, Connection, Result};
 use tokio::sync::mpsc;
@@ -80,7 +80,23 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    // 6. HTTP Observations table
+    // 6. Technology Observations table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS technology_observations (
+            id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL,
+            endpoint_url TEXT NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT,
+            confidence REAL NOT NULL,
+            evidence TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        )",
+        [],
+    )?;
+
+    // 7. HTTP Observations table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS http_observations (
             id TEXT PRIMARY KEY,
@@ -132,6 +148,7 @@ pub struct ObservationBundle {
     pub dns_records: Vec<DnsRecord>,
     pub services: Vec<ServiceRecord>,
     pub tls_record: Option<TlsRecord>,
+    pub technologies: Vec<TechnologyObservation>,
     pub http_observation: HttpObservation,
 }
 
@@ -156,6 +173,12 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
         let mut stmt_tls = tx.prepare(
             "INSERT OR REPLACE INTO tls_certificates (id, service_id, issuer, subject_ans, expires_at, observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
+        let mut stmt_tech = tx.prepare(
+            "INSERT OR REPLACE INTO technology_observations 
+             (id, scan_id, endpoint_url, name, version, confidence, evidence, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
 
         let mut stmt_http = tx.prepare(
@@ -207,6 +230,21 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                     ans_json,
                     tls.expires_at,
                     tls.observed_at.to_rfc3339(),
+                ])?;
+            }
+
+            // Save Technology Observations
+            for tech in &bundle.technologies {
+                let ev_json = serde_json::to_string(&tech.evidence).unwrap_or_default();
+                stmt_tech.execute(params![
+                    tech.id.to_string(),
+                    tech.scan_id.to_string(),
+                    tech.endpoint_url,
+                    tech.name,
+                    tech.version,
+                    tech.confidence,
+                    ev_json,
+                    tech.observed_at.to_rfc3339(),
                 ])?;
             }
 
