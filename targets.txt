@@ -1,6 +1,9 @@
-# Sample subdomains for testing
+# Sample subdomains for testing (includes duplicates & variations)
 example.com
+EXAMPLE.COM
+https://example.com/some/path
 httpbin.org
 google.com
-github.com
 cloudflare.com
+github.com
+unauthorized-attacker.org
