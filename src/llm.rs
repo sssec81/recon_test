@@ -43,11 +43,14 @@ pub async fn analyze_scan_observations(
     }
 
     let prompt = format!(
-        "You are an expert cybersecurity attack surface analyst. Analyze these bug bounty recon observations and output a concise report summarizing:\n\
-        1. High-value or anomalous targets (e.g. unexpected tech stacks, non-standard titles, dev/staging environments)\n\
-        2. Web server header distribution\n\
-        3. Prioritized next steps for security testing\n\n\
-        Observations:\n{}",
+        "You are an elite bug bounty triage engineer and offensive attack surface researcher. Analyze these target recon observations and produce an actionable bug hunting report.\n\n\
+        Focus specifically on identifying actionable Web2 misconfigurations and vulnerability vectors:\n\
+        1. Dangling CNAMEs / Subdomain Takeover risks (e.g. status ERR, 404/403/502 on third-party SaaS hosts like S3, GitHub Pages, Heroku, Shopify, Zendesk, Fastly).\n\
+        2. Exposed internal/admin dashboards, staging/dev environments, or debug endpoints (e.g. admin.*, dev.*, staging.*, portal.*, test.*, api-dev.*).\n\
+        3. Web Server & Infrastructure Fingerprint Anomalies (e.g. legacy IIS/Apache versions, Nginx default pages, misconfigured reverse proxies, missing security headers).\n\
+        4. Actionable Next Steps: Provide concrete HTTP requests, parameter fuzzing vectors, or verification commands for the top 3 highest-priority targets.\n\n\
+        Avoid generic best-practice advice. Be technical, direct, and focused on exploitability.\n\n\
+        Target Observations:\n{}",
         obs_summary
     );
 
