@@ -4,7 +4,7 @@ mod models;
 mod scanner;
 
 use clap::Parser;
-use models::Target;
+use models::{DiscoverySource, DnsRecord, Hostname, HttpObservation, ScanRun};
 use scanner::SchemeStrategy;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -13,9 +13,9 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Tool v0.3.0
+/// Async Bug Bounty Subdomain Recon Engine v0.4.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.3.0", about = "Async Rust Recon Engine with Connection Pooling & SQLite WAL Queue")]
+#[command(author, version = "0.4.0", about = "Async Rust Recon Engine with Relational Asset Graph & ScanRun Session Lineage")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -33,11 +33,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SchemeStrategy::HttpsFirst)]
     scheme_strategy: SchemeStrategy,
 
-    /// Export scan results to JSON file
+    /// Export scan observations to JSON file
     #[arg(long)]
     export_json: Option<String>,
 
-    /// Export scan results to CSV file
+    /// Export scan observations to CSV file
     #[arg(long)]
     export_csv: Option<String>,
 
@@ -63,23 +63,14 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.3.0...");
+    println!("🚀 Starting Async Recon Engine v0.4.0...");
 
-    // 1. Start SQLite WAL mode database writer thread
+    // 1. Initialize SQLite Database & start WAL writer channel
+    let conn = db::init_db(&args.db)?;
     let db_tx = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
 
-    // 2. Initialize shared HTTP Client with connection pooling
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.3.0")
-        .danger_accept_invalid_certs(true)
-        .build()?;
-
-    // 3. Determine targets to scan
+    // 2. Determine target scope
     let targets = if let Some(single_target) = args.target {
         vec![single_target]
     } else if let Some(ref file_path) = args.file {
@@ -102,6 +93,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ]
     };
 
+    // 3. Create ScanRun session
+    let mut scan_run = ScanRun::new(targets.clone(), "v0.4.0".to_string());
+    db::save_scan_run(&conn, &scan_run)?;
+    println!("🆔 Initialized ScanRun session: {}", scan_run.id);
+
+    // 4. Initialize shared HTTP Client with connection pooling
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .pool_max_idle_per_host(10)
+        .user_agent("recon_test/0.4.0")
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
     println!(
         "🔎 Scanning {} target(s) with concurrency limit of {} [Strategy: {:?}]...",
         targets.len(),
@@ -109,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.scheme_strategy
     );
 
-    // 4. Rate-limited concurrent scanning with shared HTTP client
+    // 5. Rate-limited concurrent scanning
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut set = JoinSet::new();
 
@@ -119,55 +125,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let domain = target.clone();
         let strategy = args.scheme_strategy;
         let db_channel = db_tx.clone();
+        let scan_id = scan_run.id;
 
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let scan = scanner::probe_subdomain(&client, &domain, strategy).await;
-            let ip = scanner::resolve_ip(&domain).await;
 
-            let target_obj = Target::new(
-                domain,
-                ip,
+            // 5a. Create Hostname entity with Seed lineage
+            let hostname = Hostname::new(domain.clone(), DiscoverySource::Seed, None);
+
+            // 5b. Resolve IP and create DnsRecord
+            let ip_opt = scanner::resolve_ip(&domain).await;
+            let mut dns_records = Vec::new();
+            if let Some(ref ip) = ip_opt {
+                let rec_type = if ip.contains(':') { "AAAA" } else { "A" };
+                dns_records.push(DnsRecord::new(
+                    hostname.id.clone(),
+                    rec_type.to_string(),
+                    ip.clone(),
+                    Some(300),
+                ));
+            }
+
+            // 5c. Perform HTTP Probe
+            let scan = scanner::probe_subdomain(&client, &domain, strategy).await;
+
+            let url = if domain.starts_with("http://") || domain.starts_with("https://") {
+                domain.clone()
+            } else {
+                format!("https://{}", domain)
+            };
+
+            let http_obs = HttpObservation::new(
+                scan_id,
+                domain.clone(),
+                url,
                 scan.status_code,
                 scan.title,
                 scan.server,
                 scan.rtt_ms,
+                None,
             );
 
-            // Send target observation to DB writer
-            let _ = db_channel.send(target_obj.clone()).await;
-            target_obj
+            let bundle = db::ObservationBundle {
+                hostname,
+                dns_records,
+                http_observation: http_obs.clone(),
+            };
+
+            // Send relational observation bundle to DB writer queue
+            let _ = db_channel.send(bundle).await;
+
+            http_obs
         });
     }
 
-    // 5. Collect scan execution results
+    // 6. Collect scan execution observations
     while let Some(res) = set.join_next().await {
         match res {
-            Ok(target) => {
-                let status_str = target
+            Ok(obs) => {
+                let status_str = obs
                     .status_code
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "ERR".to_string());
-                let title_str = target
+                let title_str = obs
                     .title
                     .as_deref()
                     .unwrap_or("No Title");
-                let server_str = target
-                    .server
+                let server_str = obs
+                    .server_header
                     .as_deref()
                     .unwrap_or("Unknown Server");
-                let rtt_str = target
+                let rtt_str = obs
                     .rtt_ms
                     .map(|r| format!("{}ms", r))
                     .unwrap_or_else(|| "N/A".to_string());
-                let ip_str = target
-                    .ip_address
-                    .as_deref()
-                    .unwrap_or("No IP");
 
                 println!(
-                    "  [{:<3}] {:<22} | RTT: {:<6} | Server: {:<12} | IP: {:<15} | Title: {}",
-                    status_str, target.subdomain, rtt_str, server_str, ip_str, title_str
+                    "  [{:<3}] {:<22} | RTT: {:<6} | Server: {:<12} | Title: {}",
+                    status_str, obs.hostname, rtt_str, server_str, title_str
                 );
             }
             Err(e) => eprintln!("❌ Task join error: {}", e),
@@ -177,24 +212,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Close channel sender so database writer flushes remaining records
     drop(db_tx);
 
-    // Short yield to let DB blocking task finish flushing
+    // Yield to let DB blocking task finish writing
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    println!("🎉 Scan completed successfully!");
+    // 7. Complete ScanRun session
+    scan_run.complete();
+    db::finish_scan_run(&conn, &scan_run.id)?;
 
-    // 6. Handle Data Export if requested
+    println!("🎉 ScanRun {} completed successfully!", scan_run.id);
+
+    // 8. Handle Data Export if requested
     if args.export_json.is_some() || args.export_csv.is_some() {
-        let conn = db::init_db(&args.db)?;
-        let all_targets = db::get_all_targets(&conn)?;
+        let scan_observations = db::get_scan_observations(&conn, &scan_run.id)?;
 
         if let Some(json_path) = args.export_json {
-            exporter::export_json(&all_targets, &json_path)?;
-            println!("💾 Exported {} target(s) to JSON: '{}'", all_targets.len(), json_path);
+            exporter::export_json(&scan_observations, &json_path)?;
+            println!(
+                "💾 Exported {} observation(s) from ScanRun {} to JSON: '{}'",
+                scan_observations.len(),
+                scan_run.id,
+                json_path
+            );
         }
 
         if let Some(csv_path) = args.export_csv {
-            exporter::export_csv(&all_targets, &csv_path)?;
-            println!("💾 Exported {} target(s) to CSV: '{}'", all_targets.len(), csv_path);
+            exporter::export_csv(&scan_observations, &csv_path)?;
+            println!(
+                "💾 Exported {} observation(s) from ScanRun {} to CSV: '{}'",
+                scan_observations.len(),
+                scan_run.id,
+                csv_path
+            );
         }
     }
 

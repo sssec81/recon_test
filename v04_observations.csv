@@ -1,0 +1,6 @@
+id,scan_id,hostname,url,status_code,title,server_header,rtt_ms,content_length,observed_at
+55645600-bb11-4950-949d-ff3be66509b0,d2e2b198-1ea7-42f0-9997-90c79ea78619,example.com,https://example.com,200,Example Domain,cloudflare,60,,2026-09-09T17:14:14.849172Z
+41fea180-9028-416e-aca9-5e3cb9716c92,d2e2b198-1ea7-42f0-9997-90c79ea78619,cloudflare.com,https://cloudflare.com,200,Cloudflare: Build for the agent era,cloudflare,367,,2026-09-09T17:14:15.171770Z
+e954896b-d129-459a-8c35-0f9e54b23c24,d2e2b198-1ea7-42f0-9997-90c79ea78619,google.com,https://google.com,200,Google,gws,406,,2026-09-09T17:14:15.307026Z
+4e65552d-c3f7-4962-8d17-144fb9664859,d2e2b198-1ea7-42f0-9997-90c79ea78619,github.com,https://github.com,200,GitHub · Change is constant. GitHub keeps you ahead. · GitHub,github.com,340,,2026-09-09T17:14:15.447037Z
+834165de-12ba-45f6-a3df-9c252dad3240,d2e2b198-1ea7-42f0-9997-90c79ea78619,httpbin.org,https://httpbin.org,200,httpbin.org,gunicorn/19.9.0,1206,,2026-09-09T17:14:16.038785Z

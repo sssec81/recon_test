@@ -1,54 +1,161 @@
-use crate::models::Target;
+use crate::models::{DnsRecord, Hostname, HttpObservation, ScanRun};
 use rusqlite::{params, Connection, Result};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub fn init_db(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
 
-    // Performance PRAGMAs for high-throughput SQLite execution
+    // Performance PRAGMAs for SQLite WAL mode
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;",
     )?;
 
+    // 1. Scan Runs table
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS active_targets (
-            id INTEGER PRIMARY KEY,
-            subdomain TEXT NOT NULL UNIQUE,
-            ip_address TEXT,
-            status_code INTEGER,
-            title TEXT,
-            server TEXT,
-            rtt_ms INTEGER
+        "CREATE TABLE IF NOT EXISTS scan_runs (
+            id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            root_scope TEXT NOT NULL,
+            config_hash TEXT NOT NULL
         )",
         [],
     )?;
 
-    let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN title TEXT", []);
-    let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN server TEXT", []);
-    let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN rtt_ms INTEGER", []);
+    // 2. Hostnames table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hostnames (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            discovered_from TEXT
+        )",
+        [],
+    )?;
+
+    // 3. DNS Records table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dns_records (
+            id TEXT PRIMARY KEY,
+            hostname_id TEXT NOT NULL,
+            record_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            ttl INTEGER,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(hostname_id) REFERENCES hostnames(id)
+        )",
+        [],
+    )?;
+
+    // 4. HTTP Observations table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS http_observations (
+            id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            url TEXT NOT NULL,
+            status_code INTEGER,
+            title TEXT,
+            server_header TEXT,
+            rtt_ms INTEGER,
+            content_length INTEGER,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(hostname) REFERENCES hostnames(name)
+        )",
+        [],
+    )?;
 
     Ok(conn)
 }
 
-pub fn insert_batch(conn: &mut Connection, targets: &[Target]) -> Result<()> {
+pub fn save_scan_run(conn: &Connection, scan_run: &ScanRun) -> Result<()> {
+    let root_scope_str = serde_json::to_string(&scan_run.root_scope).unwrap_or_default();
+    conn.execute(
+        "INSERT OR REPLACE INTO scan_runs (id, started_at, finished_at, root_scope, config_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            scan_run.id.to_string(),
+            scan_run.started_at.to_rfc3339(),
+            scan_run.finished_at.map(|t| t.to_rfc3339()),
+            root_scope_str,
+            scan_run.config_hash
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE scan_runs SET finished_at = ?1 WHERE id = ?2",
+        params![now, scan_run_id.to_string()],
+    )?;
+    Ok(())
+}
+
+pub struct ObservationBundle {
+    pub hostname: Hostname,
+    pub dns_records: Vec<DnsRecord>,
+    pub http_observation: HttpObservation,
+}
+
+pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle]) -> Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO active_targets 
-             (subdomain, ip_address, status_code, title, server, rtt_ms)
+        let mut stmt_host = tx.prepare(
+            "INSERT OR REPLACE INTO hostnames (id, name, source, discovered_from)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+
+        let mut stmt_dns = tx.prepare(
+            "INSERT OR REPLACE INTO dns_records (id, hostname_id, record_type, value, ttl, observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
 
-        for target in targets {
-            stmt.execute(params![
-                target.subdomain,
-                target.ip_address,
-                target.status_code.map(|s| s as i32),
-                target.title,
-                target.server,
-                target.rtt_ms.map(|r| r as i64),
+        let mut stmt_http = tx.prepare(
+            "INSERT OR REPLACE INTO http_observations 
+             (id, scan_id, hostname, url, status_code, title, server_header, rtt_ms, content_length, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+
+        for bundle in bundles {
+            // Save Hostname
+            stmt_host.execute(params![
+                bundle.hostname.id,
+                bundle.hostname.name,
+                bundle.hostname.source.to_string(),
+                bundle.hostname.discovered_from,
+            ])?;
+
+            // Save DNS Records
+            for dns in &bundle.dns_records {
+                stmt_dns.execute(params![
+                    dns.id,
+                    dns.hostname_id,
+                    dns.record_type,
+                    dns.value,
+                    dns.ttl,
+                    dns.observed_at.to_rfc3339(),
+                ])?;
+            }
+
+            // Save HTTP Observation
+            let http = &bundle.http_observation;
+            stmt_http.execute(params![
+                http.id.to_string(),
+                http.scan_id.to_string(),
+                http.hostname,
+                http.url,
+                http.status_code.map(|s| s as i32),
+                http.title,
+                http.server_header,
+                http.rtt_ms.map(|r| r as i64),
+                http.content_length.map(|c| c as i64),
+                http.observed_at.to_rfc3339(),
             ])?;
         }
     }
@@ -56,8 +163,8 @@ pub fn insert_batch(conn: &mut Connection, targets: &[Target]) -> Result<()> {
     Ok(())
 }
 
-pub fn start_db_writer(db_path: String) -> mpsc::Sender<Target> {
-    let (tx, mut rx) = mpsc::channel::<Target>(1000);
+pub fn start_db_writer(db_path: String) -> mpsc::Sender<ObservationBundle> {
+    let (tx, mut rx) = mpsc::channel::<ObservationBundle>(1000);
 
     tokio::task::spawn_blocking(move || {
         let mut conn = match init_db(&db_path) {
@@ -70,22 +177,20 @@ pub fn start_db_writer(db_path: String) -> mpsc::Sender<Target> {
 
         let mut batch = Vec::with_capacity(100);
 
-        while let Some(target) = rx.blocking_recv() {
-            batch.push(target);
+        while let Some(bundle) = rx.blocking_recv() {
+            batch.push(bundle);
 
-            // Flush whenever batch reaches 100 items
             if batch.len() >= 100 {
-                if let Err(e) = insert_batch(&mut conn, &batch) {
-                    eprintln!("❌ Error flushing SQLite batch transaction: {}", e);
+                if let Err(e) = insert_bundle_batch(&mut conn, &batch) {
+                    eprintln!("❌ Error flushing SQLite observation batch: {}", e);
                 }
                 batch.clear();
             }
         }
 
-        // Flush remaining items on channel closure
         if !batch.is_empty() {
-            if let Err(e) = insert_batch(&mut conn, &batch) {
-                eprintln!("❌ Error flushing final SQLite batch: {}", e);
+            if let Err(e) = insert_bundle_batch(&mut conn, &batch) {
+                eprintln!("❌ Error flushing final SQLite observation batch: {}", e);
             }
         }
     });
@@ -93,27 +198,40 @@ pub fn start_db_writer(db_path: String) -> mpsc::Sender<Target> {
     tx
 }
 
-pub fn get_all_targets(conn: &Connection) -> Result<Vec<Target>> {
+pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<HttpObservation>> {
     let mut stmt = conn.prepare(
-        "SELECT subdomain, ip_address, status_code, title, server, rtt_ms FROM active_targets ORDER BY id ASC",
+        "SELECT id, scan_id, hostname, url, status_code, title, server_header, rtt_ms, content_length, observed_at 
+         FROM http_observations WHERE scan_id = ?1 ORDER BY observed_at ASC",
     )?;
 
-    let target_iter = stmt.query_map([], |row| {
-        let status_code: Option<i32> = row.get(2)?;
-        let rtt_ms: Option<i64> = row.get(5)?;
-        Ok(Target {
-            subdomain: row.get(0)?,
-            ip_address: row.get(1)?,
+    let scan_id_str = scan_id.to_string();
+    let obs_iter = stmt.query_map(params![scan_id_str], |row| {
+        let id_str: String = row.get(0)?;
+        let scan_id_str: String = row.get(1)?;
+        let status_code: Option<i32> = row.get(4)?;
+        let rtt_ms: Option<i64> = row.get(7)?;
+        let content_len: Option<i64> = row.get(8)?;
+        let obs_at_str: String = row.get(9)?;
+
+        Ok(HttpObservation {
+            id: Uuid::parse_str(&id_str).unwrap_or_default(),
+            scan_id: Uuid::parse_str(&scan_id_str).unwrap_or_default(),
+            hostname: row.get(2)?,
+            url: row.get(3)?,
             status_code: status_code.map(|s| s as u16),
-            title: row.get(3)?,
-            server: row.get(4)?,
+            title: row.get(5)?,
+            server_header: row.get(6)?,
             rtt_ms: rtt_ms.map(|r| r as u64),
+            content_length: content_len.map(|c| c as usize),
+            observed_at: chrono::DateTime::parse_from_rfc3339(&obs_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
         })
     })?;
 
-    let mut targets = Vec::new();
-    for target in target_iter {
-        targets.push(target?);
+    let mut observations = Vec::new();
+    for obs in obs_iter {
+        observations.push(obs?);
     }
-    Ok(targets)
+    Ok(observations)
 }

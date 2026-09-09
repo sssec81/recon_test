@@ -1,0 +1,62 @@
+[
+  {
+    "id": "55645600-bb11-4950-949d-ff3be66509b0",
+    "scan_id": "d2e2b198-1ea7-42f0-9997-90c79ea78619",
+    "hostname": "example.com",
+    "url": "https://example.com",
+    "status_code": 200,
+    "title": "Example Domain",
+    "server_header": "cloudflare",
+    "rtt_ms": 60,
+    "content_length": null,
+    "observed_at": "2026-09-09T17:14:14.849172Z"
+  },
+  {
+    "id": "41fea180-9028-416e-aca9-5e3cb9716c92",
+    "scan_id": "d2e2b198-1ea7-42f0-9997-90c79ea78619",
+    "hostname": "cloudflare.com",
+    "url": "https://cloudflare.com",
+    "status_code": 200,
+    "title": "Cloudflare: Build for the agent era",
+    "server_header": "cloudflare",
+    "rtt_ms": 367,
+    "content_length": null,
+    "observed_at": "2026-09-09T17:14:15.171770Z"
+  },
+  {
+    "id": "e954896b-d129-459a-8c35-0f9e54b23c24",
+    "scan_id": "d2e2b198-1ea7-42f0-9997-90c79ea78619",
+    "hostname": "google.com",
+    "url": "https://google.com",
+    "status_code": 200,
+    "title": "Google",
+    "server_header": "gws",
+    "rtt_ms": 406,
+    "content_length": null,
+    "observed_at": "2026-09-09T17:14:15.307026Z"
+  },
+  {
+    "id": "4e65552d-c3f7-4962-8d17-144fb9664859",
+    "scan_id": "d2e2b198-1ea7-42f0-9997-90c79ea78619",
+    "hostname": "github.com",
+    "url": "https://github.com",
+    "status_code": 200,
+    "title": "GitHub · Change is constant. GitHub keeps you ahead. · GitHub",
+    "server_header": "github.com",
+    "rtt_ms": 340,
+    "content_length": null,
+    "observed_at": "2026-09-09T17:14:15.447037Z"
+  },
+  {
+    "id": "834165de-12ba-45f6-a3df-9c252dad3240",
+    "scan_id": "d2e2b198-1ea7-42f0-9997-90c79ea78619",
+    "hostname": "httpbin.org",
+    "url": "https://httpbin.org",
+    "status_code": 200,
+    "title": "httpbin.org",
+    "server_header": "gunicorn/19.9.0",
+    "rtt_ms": 1206,
+    "content_length": null,
+    "observed_at": "2026-09-09T17:14:16.038785Z"
+  }
+]
