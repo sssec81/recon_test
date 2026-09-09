@@ -1,8 +1,16 @@
 use crate::models::Target;
 use rusqlite::{params, Connection, Result};
+use tokio::sync::mpsc;
 
 pub fn init_db(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
+
+    // Performance PRAGMAs for high-throughput SQLite execution
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;",
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS active_targets (
@@ -17,7 +25,6 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    // Safe column additions for schema migrations
     let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN title TEXT", []);
     let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN server TEXT", []);
     let _ = conn.execute("ALTER TABLE active_targets ADD COLUMN rtt_ms INTEGER", []);
@@ -25,21 +32,65 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn insert_target(conn: &Connection, target: &Target) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO active_targets 
-         (subdomain, ip_address, status_code, title, server, rtt_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            target.subdomain,
-            target.ip_address,
-            target.status_code.map(|s| s as i32),
-            target.title,
-            target.server,
-            target.rtt_ms.map(|r| r as i64),
-        ],
-    )?;
+pub fn insert_batch(conn: &mut Connection, targets: &[Target]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO active_targets 
+             (subdomain, ip_address, status_code, title, server, rtt_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
+        for target in targets {
+            stmt.execute(params![
+                target.subdomain,
+                target.ip_address,
+                target.status_code.map(|s| s as i32),
+                target.title,
+                target.server,
+                target.rtt_ms.map(|r| r as i64),
+            ])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
+}
+
+pub fn start_db_writer(db_path: String) -> mpsc::Sender<Target> {
+    let (tx, mut rx) = mpsc::channel::<Target>(1000);
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = match init_db(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("❌ Failed to initialize SQLite database at '{}': {}", db_path, e);
+                return;
+            }
+        };
+
+        let mut batch = Vec::with_capacity(100);
+
+        while let Some(target) = rx.blocking_recv() {
+            batch.push(target);
+
+            // Flush whenever batch reaches 100 items
+            if batch.len() >= 100 {
+                if let Err(e) = insert_batch(&mut conn, &batch) {
+                    eprintln!("❌ Error flushing SQLite batch transaction: {}", e);
+                }
+                batch.clear();
+            }
+        }
+
+        // Flush remaining items on channel closure
+        if !batch.is_empty() {
+            if let Err(e) = insert_batch(&mut conn, &batch) {
+                eprintln!("❌ Error flushing final SQLite batch: {}", e);
+            }
+        }
+    });
+
+    tx
 }
 
 pub fn get_all_targets(conn: &Connection) -> Result<Vec<Target>> {

@@ -5,15 +5,17 @@ mod scanner;
 
 use clap::Parser;
 use models::Target;
+use scanner::SchemeStrategy;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Tool
+/// Async Bug Bounty Subdomain Recon Tool v0.3.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.2.0", about = "Async Rust Recon Scanner with SQLite & Export Capabilities")]
+#[command(author, version = "0.3.0", about = "Async Rust Recon Engine with Connection Pooling & SQLite WAL Queue")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -26,6 +28,10 @@ struct Args {
     /// Maximum concurrent scan tasks
     #[arg(short, long, default_value_t = 20)]
     concurrency: usize,
+
+    /// Probing scheme strategy
+    #[arg(long, value_enum, default_value_t = SchemeStrategy::HttpsFirst)]
+    scheme_strategy: SchemeStrategy,
 
     /// Export scan results to JSON file
     #[arg(long)]
@@ -57,13 +63,23 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Tool v0.2.0...");
+    println!("🚀 Starting Async Recon Engine v0.3.0...");
 
-    // 1. Initialize SQLite Database
-    let conn = db::init_db(&args.db)?;
-    println!("✅ Connected to database: '{}'", args.db);
+    // 1. Start SQLite WAL mode database writer thread
+    let db_tx = db::start_db_writer(args.db.clone());
+    println!("✅ Database WAL writer connected to '{}'", args.db);
 
-    // 2. Determine targets to scan
+    // 2. Initialize shared HTTP Client with connection pooling
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .pool_max_idle_per_host(10)
+        .user_agent("recon_test/0.3.0")
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    // 3. Determine targets to scan
     let targets = if let Some(single_target) = args.target {
         vec![single_target]
     } else if let Some(ref file_path) = args.file {
@@ -87,27 +103,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "🔎 Scanning {} target(s) with max concurrency of {}...",
+        "🔎 Scanning {} target(s) with concurrency limit of {} [Strategy: {:?}]...",
         targets.len(),
-        args.concurrency
+        args.concurrency,
+        args.scheme_strategy
     );
 
-    // 3. Semaphore for rate limiting concurrent tasks
+    // 4. Rate-limited concurrent scanning with shared HTTP client
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut set = JoinSet::new();
 
     for target in targets {
         let sem = Arc::clone(&semaphore);
+        let client = http_client.clone();
         let domain = target.clone();
+        let strategy = args.scheme_strategy;
+        let db_channel = db_tx.clone();
+
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let scan = scanner::probe_subdomain(&domain).await;
+            let scan = scanner::probe_subdomain(&client, &domain, strategy).await;
             let ip = scanner::resolve_ip(&domain).await;
-            Target::new(domain, ip, scan.status_code, scan.title, scan.server, scan.rtt_ms)
+
+            let target_obj = Target::new(
+                domain,
+                ip,
+                scan.status_code,
+                scan.title,
+                scan.server,
+                scan.rtt_ms,
+            );
+
+            // Send target observation to DB writer
+            let _ = db_channel.send(target_obj.clone()).await;
+            target_obj
         });
     }
 
-    // 4. Collect results & write to SQLite
+    // 5. Collect scan execution results
     while let Some(res) = set.join_next().await {
         match res {
             Ok(target) => {
@@ -136,19 +169,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  [{:<3}] {:<22} | RTT: {:<6} | Server: {:<12} | IP: {:<15} | Title: {}",
                     status_str, target.subdomain, rtt_str, server_str, ip_str, title_str
                 );
-
-                if let Err(e) = db::insert_target(&conn, &target) {
-                    eprintln!("❌ Error saving target to DB: {}", e);
-                }
             }
             Err(e) => eprintln!("❌ Task join error: {}", e),
         }
     }
 
+    // Close channel sender so database writer flushes remaining records
+    drop(db_tx);
+
+    // Short yield to let DB blocking task finish flushing
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     println!("🎉 Scan completed successfully!");
 
-    // 5. Handle Data Export if requested
+    // 6. Handle Data Export if requested
     if args.export_json.is_some() || args.export_csv.is_some() {
+        let conn = db::init_db(&args.db)?;
         let all_targets = db::get_all_targets(&conn)?;
 
         if let Some(json_path) = args.export_json {
