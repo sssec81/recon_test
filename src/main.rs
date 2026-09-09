@@ -4,6 +4,7 @@ mod diff;
 mod dns;
 mod exporter;
 mod fingerprint;
+mod llm;
 mod models;
 mod normalize;
 mod pipeline;
@@ -65,6 +66,18 @@ struct Args {
     #[arg(long, num_args = 2)]
     diff: Option<Vec<String>>,
 
+    /// Enable local AI attack surface analysis via Ollama
+    #[arg(long, default_value_t = false)]
+    llm_analyze: bool,
+
+    /// Ollama model name to use for local AI analysis
+    #[arg(long, default_value = "llama3:8b")]
+    ollama_model: String,
+
+    /// Ollama server base URL endpoint
+    #[arg(long, default_value = "http://localhost:11434")]
+    ollama_url: String,
+
     /// Export scan observations to JSON file
     #[arg(long)]
     export_json: Option<String>,
@@ -103,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
-    let db_tx = db::start_db_writer(args.db.clone());
+    let (db_tx, db_writer_handle) = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
 
     // 2. Initialize Async DNS Resolver & Shared HTTP Client
@@ -201,7 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Event Bus Processor Task
     let db_channel = db_tx.clone();
-    let scheduler_clone = scheduler.clone();
 
     let event_processor_handle = tokio::spawn(async move {
         let mut pending_bundles: std::collections::HashMap<String, db::ObservationBundle> =
@@ -248,14 +260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ReconEvent::TlsObserved { hostname, tls_record } => {
                     let name = hostname.as_str().to_string();
-
-                    // TLS SAN Feedback Loop: feed SAN subdomains back into Scheduler
-                    for san_domain in &tls_record.subject_ans {
-                        scheduler_clone
-                            .submit_target_with_source(san_domain, DiscoverySource::TlsSan)
-                            .await;
-                    }
-
                     if let Some(bundle) = pending_bundles.get_mut(&name) {
                         bundle.tls_record = Some(tls_record);
                     }
@@ -328,142 +332,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 10. Work Scheduler Dispatcher Loop
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut set = JoinSet::new();
+    let mut inflight = 0usize;
 
-    while let Some(work) = work_rx.recv().await {
-        match work {
-            WorkItem::ProbeTarget { hostname, source } => {
+    // Drop main scheduler instance so channel closes when all worker tasks finish
+    let main_scheduler = scheduler;
+
+    loop {
+        if inflight == 0 && work_rx.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            Some(work) = work_rx.recv() => {
+                inflight += 1;
                 let sem = Arc::clone(&semaphore);
                 let client = http_client.clone();
                 let resolver = dns_resolver.clone();
                 let strategy = args.scheme_strategy;
                 let scan_id = scan_run.id;
                 let bus = event_tx.clone();
+                let worker_scheduler = main_scheduler.clone();
 
                 set.spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
-                    // Emit HostnameDiscovered event
-                    let _ = bus
-                        .send(ReconEvent::HostnameDiscovered {
-                            hostname: hostname.clone(),
-                            source,
-                        })
-                        .await;
-
-                    // Resolve multi-record DNS
-                    let dns_records = resolver.resolve_all(hostname.as_str()).await;
-                    let _ = bus
-                        .send(ReconEvent::DnsResolved {
-                            hostname: hostname.clone(),
-                            records: dns_records,
-                        })
-                        .await;
-
-                    // Perform TCP Port Scan on default web ports
-                    let open_ports = services::probe_open_ports(hostname.as_str(), services::DEFAULT_PORTS).await;
-                    let service_records: Vec<ServiceRecord> = open_ports
-                        .iter()
-                        .map(|&port| ServiceRecord::new(hostname.as_str().to_string(), port, "tcp".to_string(), true))
-                        .collect();
-
-                    let _ = bus
-                        .send(ReconEvent::ServiceObserved {
-                            hostname: hostname.clone(),
-                            services: service_records,
-                        })
-                        .await;
-
-                    // Fetch TLS Certificate & SANs if port 443 or 8443 is open
-                    if open_ports.contains(&443) || open_ports.contains(&8443) {
-                        let tls_port = if open_ports.contains(&443) { 443 } else { 8443 };
-                        let host_str = hostname.as_str().to_string();
-                        let tls_info_opt = tokio::task::spawn_blocking(move || {
-                            tls::fetch_tls_info(&host_str, tls_port)
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-
-                        if let Some(tls_info) = tls_info_opt {
-                            let service_id = format!("{}:{}:tcp", hostname.as_str(), tls_port);
-                            let tls_rec = TlsRecord::new(
-                                service_id,
-                                tls_info.issuer,
-                                tls_info.san_domains,
-                                tls_info.expires_at,
-                            );
-
+                    match work {
+                        WorkItem::ProbeTarget { hostname, source } => {
+                            // Emit HostnameDiscovered event
                             let _ = bus
-                                .send(ReconEvent::TlsObserved {
+                                .send(ReconEvent::HostnameDiscovered {
                                     hostname: hostname.clone(),
-                                    tls_record: tls_rec,
+                                    source,
                                 })
                                 .await;
+
+                            // Resolve multi-record DNS
+                            let dns_records = resolver.resolve_all(scan_id, hostname.as_str()).await;
+                            let _ = bus
+                                .send(ReconEvent::DnsResolved {
+                                    hostname: hostname.clone(),
+                                    records: dns_records,
+                                })
+                                .await;
+
+                            // Perform TCP Port Scan on default web ports
+                            let open_ports = services::probe_open_ports(hostname.as_str(), services::DEFAULT_PORTS).await;
+                            let service_records: Vec<ServiceRecord> = open_ports
+                                .iter()
+                                .map(|&port| ServiceRecord::new(hostname.as_str().to_string(), port, "tcp".to_string(), true))
+                                .collect();
+
+                            let _ = bus
+                                .send(ReconEvent::ServiceObserved {
+                                    hostname: hostname.clone(),
+                                    services: service_records,
+                                })
+                                .await;
+
+                            // Fetch TLS Certificate & SANs if port 443 or 8443 is open
+                            if open_ports.contains(&443) || open_ports.contains(&8443) {
+                                let tls_port = if open_ports.contains(&443) { 443 } else { 8443 };
+                                let host_str = hostname.as_str().to_string();
+                                let tls_info_opt = tokio::task::spawn_blocking(move || {
+                                    tls::fetch_tls_info(&host_str, tls_port)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+
+                                if let Some(tls_info) = tls_info_opt {
+                                    // TLS SAN Feedback Loop: submit SAN subdomains directly in active worker
+                                    for san_domain in &tls_info.san_domains {
+                                        worker_scheduler
+                                            .submit_target_with_source(san_domain, DiscoverySource::TlsSan)
+                                            .await;
+                                    }
+
+                                    let service_id = format!("{}:{}:tcp", hostname.as_str(), tls_port);
+                                    let tls_rec = TlsRecord::new(
+                                        service_id,
+                                        tls_info.issuer,
+                                        tls_info.san_domains,
+                                        tls_info.expires_at,
+                                    );
+
+                                    let _ = bus
+                                        .send(ReconEvent::TlsObserved {
+                                            hostname: hostname.clone(),
+                                            tls_record: tls_rec,
+                                        })
+                                        .await;
+                                }
+                            }
+
+                            // Perform HTTP Probe
+                            let scan = scanner::probe_subdomain(&client, hostname.as_str(), strategy).await;
+
+                            // Winning URL Scheme propagation
+                            let url = scan
+                                .final_url
+                                .clone()
+                                .unwrap_or_else(|| format!("https://{}", hostname.as_str()));
+
+                            let status = scan.status_code.unwrap_or(0);
+                            let raw_detections = fingerprint::fingerprint_tech(&scan.headers, &scan.body_snippet, status);
+
+                            let tech_observations: Vec<TechnologyObservation> = raw_detections
+                                .into_iter()
+                                .map(|d| {
+                                    TechnologyObservation::new(
+                                        scan_id,
+                                        url.clone(),
+                                        d.name,
+                                        d.version,
+                                        d.confidence,
+                                        d.evidence,
+                                    )
+                                })
+                                .collect();
+
+                            if !tech_observations.is_empty() {
+                                let _ = bus
+                                    .send(ReconEvent::TechnologyDetected {
+                                        hostname: hostname.clone(),
+                                        technologies: tech_observations,
+                                    })
+                                    .await;
+                            }
+
+                            let http_obs = HttpObservation::new(
+                                scan_id,
+                                hostname.as_str().to_string(),
+                                url,
+                                scan.status_code,
+                                scan.title,
+                                scan.server,
+                                scan.rtt_ms,
+                                None,
+                            );
+
+                            let _ = bus.send(ReconEvent::HttpObserved(http_obs)).await;
                         }
                     }
-
-                    // Perform HTTP Probe
-                    let scan = scanner::probe_subdomain(&client, hostname.as_str(), strategy).await;
-
-                    // Technology Fingerprinting with Confidence & Evidence
-                    let url = format!("https://{}", hostname.as_str());
-                    let status = scan.status_code.unwrap_or(0);
-                    let raw_detections = fingerprint::fingerprint_tech(&scan.headers, &scan.body_snippet, status);
-
-                    let tech_observations: Vec<TechnologyObservation> = raw_detections
-                        .into_iter()
-                        .map(|d| {
-                            TechnologyObservation::new(
-                                scan_id,
-                                url.clone(),
-                                d.name,
-                                d.version,
-                                d.confidence,
-                                d.evidence,
-                            )
-                        })
-                        .collect();
-
-                    if !tech_observations.is_empty() {
-                        let _ = bus
-                            .send(ReconEvent::TechnologyDetected {
-                                hostname: hostname.clone(),
-                                technologies: tech_observations,
-                            })
-                            .await;
-                    }
-
-                    let http_obs = HttpObservation::new(
-                        scan_id,
-                        hostname.as_str().to_string(),
-                        url,
-                        scan.status_code,
-                        scan.title,
-                        scan.server,
-                        scan.rtt_ms,
-                        None,
-                    );
-
-                    let _ = bus.send(ReconEvent::HttpObserved(http_obs)).await;
                 });
             }
-        }
-
-        if work_rx.is_empty() {
-            break;
+            Some(_) = set.join_next(), if inflight > 0 => {
+                inflight -= 1;
+            }
+            else => break,
         }
     }
 
-    // Wait for worker tasks to complete
-    while let Some(_) = set.join_next().await {}
+    drop(main_scheduler);
 
     // Drop event_tx & work_tx to close processor cleanly
     drop(event_tx);
     let _ = event_processor_handle.await;
 
-    // Drop db_tx to flush remaining SQLite records
+    // Drop db_tx to flush remaining SQLite records and await writer completion
     drop(db_tx);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = db_writer_handle.await;
 
     // 11. Complete ScanRun session
     scan_run.complete();
@@ -543,6 +571,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => eprintln!("❌ Failed to calculate scan diff: {}", e),
+        }
+    }
+
+    // 14. Local AI Attack Surface Analysis via Ollama (if requested)
+    if args.llm_analyze {
+        let scan_observations = db::get_scan_observations(&conn, &scan_run.id)?;
+        println!(
+            "\n🤖 Generating Local AI Attack Surface Assessment via Ollama ({}) at '{}'...",
+            args.ollama_model, args.ollama_url
+        );
+
+        match llm::analyze_scan_observations(&http_client, &args.ollama_url, &args.ollama_model, &scan_observations).await {
+            Ok(ai_summary) => {
+                println!("\n=== 🤖 Local AI Attack Surface Assessment ===");
+                println!("{}", ai_summary.trim());
+                println!("=============================================");
+            }
+            Err(e) => eprintln!("⚠️  Local LLM analysis failed: {}", e),
+        }
+
+        if let Some((id_a, id_b)) = diff_run_ids {
+            if let Ok(diff_result) = diff::compare_scan_runs(&conn, &id_a, &id_b) {
+                println!(
+                    "\n🤖 Generating Local AI Scan Diff Threat Assessment via Ollama ({}) ...",
+                    args.ollama_model
+                );
+                match llm::analyze_scan_diff(&http_client, &args.ollama_url, &args.ollama_model, &diff_result).await {
+                    Ok(diff_ai_summary) => {
+                        println!("\n=== 🤖 Local AI Scan Diff Assessment ===");
+                        println!("{}", diff_ai_summary.trim());
+                        println!("========================================");
+                    }
+                    Err(e) => eprintln!("⚠️  Local LLM diff analysis failed: {}", e),
+                }
+            }
         }
     }
 

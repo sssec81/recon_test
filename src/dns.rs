@@ -3,6 +3,7 @@ use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioAsyncResolver;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AsyncDnsResolver {
@@ -20,17 +21,18 @@ impl AsyncDnsResolver {
         }
     }
 
-    pub async fn resolve_all(&self, hostname: &str) -> Vec<DnsRecord> {
+    pub async fn resolve_all(&self, scan_id: Uuid, hostname: &str) -> Vec<DnsRecord> {
         let mut records = Vec::new();
 
         // 1. Resolve A records (IPv4)
         if let Ok(lookup) = self.resolver.ipv4_lookup(hostname).await {
             for ip in lookup.iter() {
                 records.push(DnsRecord::new(
+                    scan_id,
                     hostname.to_string(),
                     "A".to_string(),
                     ip.to_string(),
-                    Some(300),
+                    None,
                 ));
             }
         }
@@ -39,10 +41,11 @@ impl AsyncDnsResolver {
         if let Ok(lookup) = self.resolver.ipv6_lookup(hostname).await {
             for ip in lookup.iter() {
                 records.push(DnsRecord::new(
+                    scan_id,
                     hostname.to_string(),
                     "AAAA".to_string(),
                     ip.to_string(),
-                    Some(300),
+                    None,
                 ));
             }
         }
@@ -52,10 +55,11 @@ impl AsyncDnsResolver {
             for record in lookup.iter() {
                 if let Some(cname) = record.as_cname() {
                     records.push(DnsRecord::new(
+                        scan_id,
                         hostname.to_string(),
                         "CNAME".to_string(),
                         cname.to_string().trim_end_matches('.').to_string(),
-                        Some(300),
+                        None,
                     ));
                 }
             }
@@ -66,10 +70,11 @@ impl AsyncDnsResolver {
             for record in lookup.iter() {
                 if let Some(mx) = record.as_mx() {
                     records.push(DnsRecord::new(
+                        scan_id,
                         hostname.to_string(),
                         "MX".to_string(),
                         mx.exchange().to_string().trim_end_matches('.').to_string(),
-                        Some(300),
+                        None,
                     ));
                 }
             }
@@ -82,10 +87,11 @@ impl AsyncDnsResolver {
                 if let Some(addr) = addrs.next() {
                     let rec_type = if addr.ip().is_ipv6() { "AAAA" } else { "A" };
                     records.push(DnsRecord::new(
+                        scan_id,
                         hostname.to_string(),
                         rec_type.to_string(),
                         addr.ip().to_string(),
-                        Some(300),
+                        None,
                     ));
                 }
             }

@@ -1271,7 +1271,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-native-tls",
  "uuid",
  "x509-parser",
 ]

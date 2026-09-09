@@ -2,9 +2,5 @@
 *.db
 *.db-shm
 *.db-wal
-results.json
-results.csv
-v03_results.json
-v03_results.csv
-v04_observations.json
-v04_observations.csv
+*.json
+*.csv

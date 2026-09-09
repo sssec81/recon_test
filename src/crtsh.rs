@@ -21,30 +21,56 @@ pub async fn query_crtsh(client: &Client, domain: &str) -> Vec<String> {
     }
 
     let url = format!("https://crt.sh/?q=%.{}&output=json", clean_domain);
-
     let mut discovered = HashSet::new();
+    let max_attempts = 3;
 
-    let req_fut = client
-        .get(&url)
-        .header("User-Agent", "recon_test/0.7.0")
-        .timeout(Duration::from_secs(12))
-        .send();
+    for attempt in 1..=max_attempts {
+        let req_res = client
+            .get(&url)
+            .header("User-Agent", "recon_test/1.0.0")
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await;
 
-    if let Ok(response) = req_fut.await {
-        if response.status().is_success() {
-            if let Ok(entries) = response.json::<Vec<CrtShEntry>>().await {
-                for entry in entries {
-                    for line in entry.name_value.lines() {
-                        let mut name = line.trim().to_lowercase();
-                        if name.starts_with("*.") {
-                            name = name["*.".len()..].to_string();
-                        }
-                        if !name.is_empty() && name.contains(&clean_domain) {
-                            discovered.insert(name);
+        match req_res {
+            Ok(response) if response.status().is_success() => {
+                if let Ok(entries) = response.json::<Vec<CrtShEntry>>().await {
+                    for entry in entries {
+                        for line in entry.name_value.lines() {
+                            let mut name = line.trim().to_lowercase();
+                            if name.starts_with("*.") {
+                                name = name["*.".len()..].to_string();
+                            }
+                            if !name.is_empty() && name.contains(&clean_domain) {
+                                discovered.insert(name);
+                            }
                         }
                     }
+                    return discovered.into_iter().collect();
                 }
             }
+            Ok(res) => {
+                if attempt == max_attempts {
+                    eprintln!(
+                        "⚠️  [crt.sh] HTTP error {} querying subdomains for '{}' after {} attempts",
+                        res.status(),
+                        clean_domain,
+                        max_attempts
+                    );
+                }
+            }
+            Err(e) => {
+                if attempt == max_attempts {
+                    eprintln!(
+                        "⚠️  [crt.sh] Request failed for domain '{}': {} (after {} attempts)",
+                        clean_domain, e, max_attempts
+                    );
+                }
+            }
+        }
+
+        if attempt < max_attempts {
+            tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
         }
     }
 

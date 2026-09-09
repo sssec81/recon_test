@@ -1,0 +1,15 @@
+# Shopify In-Scope Target Seeds (from HackerOne program scope)
+partners.shopify.com
+accounts.shopify.com
+admin.shopify.com
+shop.app
+shopify.plus
+linkpop.com
+shopifyinbox.com
+arrive-server.shopifycloud.com
+shopify.com
+shopify.io
+shopifycloud.com
+shopifykloud.com
+shopifycs.com
+pci.shopifyinc.com

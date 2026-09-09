@@ -30,3 +30,20 @@ impl ScopePolicy {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scope_policy() {
+        let policy = ScopePolicy::new(vec!["example.com".to_string()]);
+        let in_scope = NormalizedHostname::new("sub.example.com").unwrap();
+        let out_scope = NormalizedHostname::new("evil.com").unwrap();
+        let root_exact = NormalizedHostname::new("example.com").unwrap();
+
+        assert!(policy.is_in_scope(&in_scope));
+        assert!(policy.is_in_scope(&root_exact));
+        assert!(!policy.is_in_scope(&out_scope));
+    }
+}

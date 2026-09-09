@@ -38,16 +38,24 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
+    // Migration for existing v1.0.0 databases missing scan_id in dns_records
+    let _ = conn.execute(
+        "ALTER TABLE dns_records ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
     // 3. DNS Records table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dns_records (
             id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL,
             hostname_id TEXT NOT NULL,
             record_type TEXT NOT NULL,
             value TEXT NOT NULL,
             ttl INTEGER,
             observed_at TEXT NOT NULL,
-            FOREIGN KEY(hostname_id) REFERENCES hostnames(id)
+            FOREIGN KEY(hostname_id) REFERENCES hostnames(id),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
         )",
         [],
     )?;
@@ -121,8 +129,9 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 pub fn save_scan_run(conn: &Connection, scan_run: &ScanRun) -> Result<()> {
     let root_scope_str = serde_json::to_string(&scan_run.root_scope).unwrap_or_default();
     conn.execute(
-        "INSERT OR REPLACE INTO scan_runs (id, started_at, finished_at, root_scope, config_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO scan_runs (id, started_at, finished_at, root_scope, config_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET finished_at = EXCLUDED.finished_at",
         params![
             scan_run.id.to_string(),
             scan_run.started_at.to_rfc3339(),
@@ -145,7 +154,7 @@ pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
 
 pub fn get_last_two_scan_runs(conn: &Connection) -> Result<Option<(ScanRun, ScanRun)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, started_at, finished_at, root_scope, config_hash FROM scan_runs ORDER BY started_at DESC LIMIT 2",
+        "SELECT id, started_at, finished_at, root_scope, config_hash FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY started_at DESC LIMIT 2",
     )?;
 
     let runs_iter = stmt.query_map([], |row| {
@@ -197,35 +206,53 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
     let tx = conn.transaction()?;
     {
         let mut stmt_host = tx.prepare(
-            "INSERT OR REPLACE INTO hostnames (id, name, source, discovered_from)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO hostnames (id, name, source, discovered_from)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+               source = EXCLUDED.source,
+               discovered_from = COALESCE(EXCLUDED.discovered_from, hostnames.discovered_from)",
         )?;
 
         let mut stmt_dns = tx.prepare(
-            "INSERT OR REPLACE INTO dns_records (id, hostname_id, record_type, value, ttl, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO dns_records (id, scan_id, hostname_id, record_type, value, ttl, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET observed_at = EXCLUDED.observed_at",
         )?;
 
         let mut stmt_svc = tx.prepare(
-            "INSERT OR REPLACE INTO services (id, hostname, port, protocol, is_open, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO services (id, hostname, port, protocol, is_open, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET is_open = EXCLUDED.is_open, observed_at = EXCLUDED.observed_at",
         )?;
 
         let mut stmt_tls = tx.prepare(
-            "INSERT OR REPLACE INTO tls_certificates (id, service_id, issuer, subject_ans, expires_at, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO tls_certificates (id, service_id, issuer, subject_ans, expires_at, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               issuer = EXCLUDED.issuer,
+               subject_ans = EXCLUDED.subject_ans,
+               expires_at = EXCLUDED.expires_at,
+               observed_at = EXCLUDED.observed_at",
         )?;
 
         let mut stmt_tech = tx.prepare(
-            "INSERT OR REPLACE INTO technology_observations 
+            "INSERT INTO technology_observations 
              (id, scan_id, endpoint_url, name, version, confidence, evidence, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET confidence = EXCLUDED.confidence",
         )?;
 
         let mut stmt_http = tx.prepare(
-            "INSERT OR REPLACE INTO http_observations 
+            "INSERT INTO http_observations 
              (id, scan_id, hostname, url, status_code, title, server_header, rtt_ms, content_length, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               status_code = EXCLUDED.status_code,
+               title = EXCLUDED.title,
+               server_header = EXCLUDED.server_header,
+               rtt_ms = EXCLUDED.rtt_ms,
+               content_length = EXCLUDED.content_length,
+               observed_at = EXCLUDED.observed_at",
         )?;
 
         for bundle in bundles {
@@ -241,6 +268,7 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
             for dns in &bundle.dns_records {
                 stmt_dns.execute(params![
                     dns.id,
+                    dns.scan_id.to_string(),
                     dns.hostname_id,
                     dns.record_type,
                     dns.value,
@@ -309,10 +337,15 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
     Ok(())
 }
 
-pub fn start_db_writer(db_path: String) -> mpsc::Sender<ObservationBundle> {
+pub fn start_db_writer(
+    db_path: String,
+) -> (
+    mpsc::Sender<ObservationBundle>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, mut rx) = mpsc::channel::<ObservationBundle>(1000);
 
-    tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         let mut conn = match init_db(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -341,7 +374,7 @@ pub fn start_db_writer(db_path: String) -> mpsc::Sender<ObservationBundle> {
         }
     });
 
-    tx
+    (tx, handle)
 }
 
 pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<HttpObservation>> {
@@ -380,4 +413,53 @@ pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<Ht
         observations.push(obs?);
     }
     Ok(observations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{DiscoverySource, Hostname, HttpObservation};
+
+    #[test]
+    fn test_rescan_foreign_key_safety() {
+        let mut conn = init_db(":memory:").expect("Failed to init in-memory DB");
+        let scan_run = ScanRun::new(vec!["example.com".to_string()], "test_hash".to_string());
+        save_scan_run(&conn, &scan_run).expect("Failed to save scan run");
+
+        let host = Hostname::new("sub.example.com".to_string(), DiscoverySource::Seed, None);
+        let http_obs = HttpObservation::new(
+            scan_run.id,
+            "sub.example.com".to_string(),
+            "https://sub.example.com".to_string(),
+            Some(200),
+            Some("Test".to_string()),
+            None,
+            Some(50),
+            None,
+        );
+
+        let bundle1 = ObservationBundle {
+            hostname: host.clone(),
+            dns_records: Vec::new(),
+            services: Vec::new(),
+            tls_record: None,
+            technologies: Vec::new(),
+            http_observation: http_obs.clone(),
+        };
+
+        // First scan insert
+        insert_bundle_batch(&mut conn, &[bundle1]).expect("First scan batch insert failed");
+
+        // Second scan insert (rescan of exact same host with foreign keys ON)
+        let bundle2 = ObservationBundle {
+            hostname: host,
+            dns_records: Vec::new(),
+            services: Vec::new(),
+            tls_record: None,
+            technologies: Vec::new(),
+            http_observation: http_obs,
+        };
+
+        insert_bundle_batch(&mut conn, &[bundle2]).expect("Rescan batch insert failed due to foreign key failure!");
+    }
 }

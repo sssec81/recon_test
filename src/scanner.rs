@@ -3,6 +3,7 @@ use std::time::Instant;
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
+    pub final_url: Option<String>,
     pub status_code: Option<u16>,
     pub title: Option<String>,
     pub server: Option<String>,
@@ -49,6 +50,7 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
     let response = client.get(url).send().await.ok()?;
     let rtt_ms = start.elapsed().as_millis() as u64;
 
+    let final_url = Some(response.url().as_str().to_string());
     let status_code = Some(response.status().as_u16());
     let headers = response.headers().clone();
     let server = headers
@@ -77,6 +79,7 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
     let title = extract_title(&body_str);
 
     Some(ScanResult {
+        final_url,
         status_code,
         title,
         server,
@@ -131,5 +134,22 @@ pub async fn probe_subdomain(
 
             ScanResult::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_title() {
+        let html = "<html><head><title> Example Title </title></head><body></body></html>";
+        assert_eq!(extract_title(html), Some("Example Title".to_string()));
+
+        let html_multiline = "<html><head><title>\n  Multi \n Line \n</title></head></html>";
+        assert_eq!(extract_title(html_multiline), Some("Multi   Line".to_string()));
+
+        let no_title = "<html><body>No Title</body></html>";
+        assert_eq!(extract_title(no_title), None);
     }
 }

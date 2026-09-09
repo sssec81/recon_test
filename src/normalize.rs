@@ -45,9 +45,11 @@ impl std::fmt::Display for NormalizedHostname {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NormalizedUrl(pub String);
 
+#[allow(dead_code)]
 impl NormalizedUrl {
     pub fn new(hostname: &NormalizedHostname, scheme: &str) -> Self {
         let s = scheme.to_lowercase();
@@ -57,5 +59,23 @@ impl NormalizedUrl {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalized_hostname() {
+        assert_eq!(
+            NormalizedHostname::new("https://sub.example.com/path?arg=1"),
+            Some(NormalizedHostname("sub.example.com".to_string()))
+        );
+        assert_eq!(
+            NormalizedHostname::new("http://EXAMPLE.COM:8080/"),
+            Some(NormalizedHostname("example.com".to_string()))
+        );
+        assert_eq!(NormalizedHostname::new("  "), None);
     }
 }

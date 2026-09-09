@@ -72,6 +72,7 @@ impl Hostname {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRecord {
     pub id: String,
+    pub scan_id: Uuid,
     pub hostname_id: String,
     pub record_type: String, // A, AAAA, CNAME
     pub value: String,
@@ -80,10 +81,17 @@ pub struct DnsRecord {
 }
 
 impl DnsRecord {
-    pub fn new(hostname_id: String, record_type: String, value: String, ttl: Option<u32>) -> Self {
-        let id = format!("{}:{}:{}", hostname_id, record_type, value);
+    pub fn new(
+        scan_id: Uuid,
+        hostname_id: String,
+        record_type: String,
+        value: String,
+        ttl: Option<u32>,
+    ) -> Self {
+        let id = format!("{}:{}:{}:{}", scan_id, hostname_id, record_type, value);
         Self {
             id,
+            scan_id,
             hostname_id,
             record_type,
             value,

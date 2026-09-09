@@ -73,15 +73,17 @@ fn fetch_scan_http_obs(
 
 fn fetch_scan_dns_records(
     conn: &Connection,
+    scan_id: &Uuid,
     hostnames: &[String],
 ) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
     let mut map = HashMap::new();
+    let scan_id_str = scan_id.to_string();
 
     for host in hostnames {
         let mut stmt = conn.prepare(
-            "SELECT value FROM dns_records WHERE hostname_id = ?1 AND (record_type = 'A' OR record_type = 'AAAA')",
+            "SELECT value FROM dns_records WHERE scan_id = ?1 AND hostname_id = ?2 AND (record_type = 'A' OR record_type = 'AAAA')",
         )?;
-        let rows = stmt.query_map(params![host.to_lowercase()], |row| {
+        let rows = stmt.query_map(params![scan_id_str, host.to_lowercase()], |row| {
             let val: String = row.get(0)?;
             Ok(val)
         })?;
@@ -149,14 +151,15 @@ pub fn compare_scan_runs(
         }
     }
 
-    // 3. DNS IP Changes
+    // 3. DNS IP Changes (Scoped per ScanRun)
     let all_hosts: Vec<String> = keys_a.union(&keys_b).cloned().collect();
-    let dns_map = fetch_scan_dns_records(conn, &all_hosts)?;
+    let dns_a = fetch_scan_dns_records(conn, scan_id_a, &all_hosts)?;
+    let dns_b = fetch_scan_dns_records(conn, scan_id_b, &all_hosts)?;
 
     let mut ip_changes = Vec::new();
     for host in keys_a.intersection(&keys_b) {
-        let ips_a = dns_map.get(host).cloned().unwrap_or_default();
-        let ips_b = dns_map.get(host).cloned().unwrap_or_default();
+        let ips_a = dns_a.get(host).cloned().unwrap_or_default();
+        let ips_b = dns_b.get(host).cloned().unwrap_or_default();
         if ips_a != ips_b {
             ip_changes.push(IpChange {
                 hostname: host.clone(),
