@@ -7,7 +7,10 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum WorkItem {
-    ProbeTarget { hostname: NormalizedHostname },
+    ProbeTarget {
+        hostname: NormalizedHostname,
+        source: DiscoverySource,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -39,26 +42,36 @@ impl Scheduler {
         }
     }
 
-    pub async fn submit_raw_target(&self, raw_target: &str) -> bool {
+    pub async fn submit_target_with_source(&self, raw_target: &str, source: DiscoverySource) -> bool {
         let norm = match NormalizedHostname::new(raw_target) {
             Some(n) => n,
             None => return false,
         };
 
         if !self.scope.is_in_scope(&norm) {
-            println!("🛡️ Out-of-scope target blocked by ScopePolicy: {}", raw_target);
             return false;
         }
 
         {
             let mut seen = self.seen_hostnames.lock().unwrap();
             if !seen.insert(norm.clone()) {
-                // Already seen & queued (deduplicated)
+                // Deduplicated
                 return false;
             }
         }
 
-        let _ = self.work_tx.send(WorkItem::ProbeTarget { hostname: norm }).await;
+        let _ = self
+            .work_tx
+            .send(WorkItem::ProbeTarget {
+                hostname: norm,
+                source,
+            })
+            .await;
         true
+    }
+
+    pub async fn submit_raw_target(&self, raw_target: &str) -> bool {
+        self.submit_target_with_source(raw_target, DiscoverySource::Seed)
+            .await
     }
 }

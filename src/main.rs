@@ -1,3 +1,4 @@
+mod crtsh;
 mod db;
 mod dns;
 mod exporter;
@@ -20,9 +21,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Engine v0.6.0
+/// Async Bug Bounty Subdomain Recon Engine v0.7.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.6.0", about = "Async Rust Recon Engine with Hickory DNS & Wildcard Catch-All Detection")]
+#[command(author, version = "0.7.0", about = "Async Rust Recon Engine with Passive CT Log Ingestion & Feedback Loop")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -39,6 +40,10 @@ struct Args {
     /// Maximum concurrent scan tasks
     #[arg(short, long, default_value_t = 20)]
     concurrency: usize,
+
+    /// Enable passive Certificate Transparency reconnaissance
+    #[arg(long, default_value_t = true)]
+    passive: bool,
 
     /// Probing scheme strategy
     #[arg(long, value_enum, default_value_t = SchemeStrategy::HttpsFirst)]
@@ -74,15 +79,23 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.6.0...");
+    println!("🚀 Starting Async Recon Engine v0.7.0...");
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
     let db_tx = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
 
-    // 2. Initialize Async DNS Resolver
+    // 2. Initialize Async DNS Resolver & Shared HTTP Client
     let dns_resolver = AsyncDnsResolver::new();
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .pool_max_idle_per_host(10)
+        .user_agent("recon_test/0.7.0")
+        .danger_accept_invalid_certs(true)
+        .build()?;
 
     // 3. Determine raw target inputs
     let raw_targets = if let Some(single_target) = args.target {
@@ -115,8 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let scope_policy = ScopePolicy::new(root_scope.clone());
-    let (work_tx, mut work_rx) = mpsc::channel::<WorkItem>(1000);
-    let (event_tx, mut event_rx) = mpsc::channel::<ReconEvent>(1000);
+    let (work_tx, mut work_rx) = mpsc::channel::<WorkItem>(10000);
+    let (event_tx, mut event_rx) = mpsc::channel::<ReconEvent>(10000);
 
     let scheduler = Scheduler::new(scope_policy, work_tx);
 
@@ -128,11 +141,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 6. Create ScanRun session
-    let mut scan_run = ScanRun::new(root_scope, "v0.6.0".to_string());
+    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.7.0".to_string());
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
-    // 7. Submit raw target inputs to Scheduler
+    // 7. Submit raw target inputs to Scheduler (Seed Lineage)
     let mut queued_count = 0;
     for raw in &raw_targets {
         if scheduler.submit_raw_target(raw).await {
@@ -140,20 +153,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 8. Perform Passive Reconnaissance (crt.sh Ingestion Feedback Loop)
+    if args.passive {
+        println!("📜 Ingesting passive Certificate Transparency logs (crt.sh)...");
+        for root_domain in &root_scope {
+            let ct_subdomains = crtsh::query_crtsh(&http_client, root_domain).await;
+            println!(
+                "  [crt.sh] Discovered {} candidate subdomain(s) for domain '{}'",
+                ct_subdomains.len(),
+                root_domain
+            );
+            for ct_sub in ct_subdomains {
+                if scheduler
+                    .submit_target_with_source(&ct_sub, DiscoverySource::CertificateTransparency)
+                    .await
+                {
+                    queued_count += 1;
+                }
+            }
+        }
+    }
+
     println!(
-        "🔎 Scheduler queued {} in-scope target(s) for scanning [Strategy: {:?}]...",
+        "🔎 Scheduler queued {} total in-scope target(s) for scanning [Strategy: {:?}]...",
         queued_count, args.scheme_strategy
     );
-
-    // 8. Shared HTTP Client with connection pooling
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.6.0")
-        .danger_accept_invalid_certs(true)
-        .build()?;
 
     // 9. Event Bus Processor Task
     let db_channel = db_tx.clone();
@@ -210,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| "N/A".to_string());
 
                     println!(
-                        "  [{:<3}] {:<22} | RTT: {:<6} | Server: {:<12} | Title: {}",
+                        "  [{:<3}] {:<32} | RTT: {:<6} | Server: {:<12} | Title: {}",
                         status_str, obs.hostname, rtt_str, server_str, title_str
                     );
 
@@ -238,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(work) = work_rx.recv().await {
         match work {
-            WorkItem::ProbeTarget { hostname } => {
+            WorkItem::ProbeTarget { hostname, source } => {
                 let sem = Arc::clone(&semaphore);
                 let client = http_client.clone();
                 let resolver = dns_resolver.clone();
@@ -249,18 +273,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set.spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
-                    // Emit HostnameDiscovered event
-                    let _ = bus.send(ReconEvent::HostnameDiscovered {
-                        hostname: hostname.clone(),
-                        source: DiscoverySource::Seed,
-                    }).await;
+                    // Emit HostnameDiscovered event with DiscoverySource attribution
+                    let _ = bus
+                        .send(ReconEvent::HostnameDiscovered {
+                            hostname: hostname.clone(),
+                            source,
+                        })
+                        .await;
 
                     // Resolve multi-record DNS asynchronously
                     let dns_records = resolver.resolve_all(hostname.as_str()).await;
-                    let _ = bus.send(ReconEvent::DnsResolved {
-                        hostname: hostname.clone(),
-                        records: dns_records,
-                    }).await;
+                    let _ = bus
+                        .send(ReconEvent::DnsResolved {
+                            hostname: hostname.clone(),
+                            records: dns_records,
+                        })
+                        .await;
 
                     // Perform HTTP Probe & emit HttpObserved event
                     let scan = scanner::probe_subdomain(&client, hostname.as_str(), strategy).await;
@@ -287,14 +315,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Wait for all worker tasks to finish
+    // Wait for worker tasks to complete
     while let Some(_) = set.join_next().await {}
 
-    // Drop event_tx & work_tx so event_processor_handle closes cleanly
+    // Drop event_tx & work_tx to close processor cleanly
     drop(event_tx);
     let _ = event_processor_handle.await;
 
-    // Drop db_tx to flush remaining records
+    // Drop db_tx to flush remaining SQLite records
     drop(db_tx);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
