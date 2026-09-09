@@ -1,0 +1,6 @@
+# Sample subdomains for testing
+example.com
+httpbin.org
+google.com
+github.com
+cloudflare.com
