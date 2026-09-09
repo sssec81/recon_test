@@ -143,6 +143,47 @@ pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
     Ok(())
 }
 
+pub fn get_last_two_scan_runs(conn: &Connection) -> Result<Option<(ScanRun, ScanRun)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, started_at, finished_at, root_scope, config_hash FROM scan_runs ORDER BY started_at DESC LIMIT 2",
+    )?;
+
+    let runs_iter = stmt.query_map([], |row| {
+        let id_str: String = row.get(0)?;
+        let start_str: String = row.get(1)?;
+        let finish_str: Option<String> = row.get(2)?;
+        let scope_json: String = row.get(3)?;
+        let hash: String = row.get(4)?;
+
+        let root_scope: Vec<String> = serde_json::from_str(&scope_json).unwrap_or_default();
+
+        Ok(ScanRun {
+            id: Uuid::parse_str(&id_str).unwrap_or_default(),
+            started_at: chrono::DateTime::parse_from_rfc3339(&start_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            finished_at: finish_str.and_then(|f| {
+                chrono::DateTime::parse_from_rfc3339(&f)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok()
+            }),
+            root_scope,
+            config_hash: hash,
+        })
+    })?;
+
+    let mut runs = Vec::new();
+    for r in runs_iter {
+        runs.push(r?);
+    }
+
+    if runs.len() == 2 {
+        Ok(Some((runs[1].clone(), runs[0].clone())))
+    } else {
+        Ok(None)
+    }
+}
+
 pub struct ObservationBundle {
     pub hostname: Hostname,
     pub dns_records: Vec<DnsRecord>,

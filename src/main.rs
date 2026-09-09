@@ -1,5 +1,6 @@
 mod crtsh;
 mod db;
+mod diff;
 mod dns;
 mod exporter;
 mod fingerprint;
@@ -26,10 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
-/// Async Bug Bounty Subdomain Recon Engine v0.9.0
+/// Async Bug Bounty Subdomain Recon Engine v1.0.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.9.0", about = "Async Rust Recon Engine with Tech & WAF Fingerprinting (Confidence & Evidence Scoring)")]
+#[command(author, version = "1.0.0", about = "Async Rust Recon Engine v1.0 with Scan Diffing & Attack Surface Change Tracking")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -55,6 +57,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SchemeStrategy::HttpsFirst)]
     scheme_strategy: SchemeStrategy,
 
+    /// Automatically diff current scan against the previous scan run
+    #[arg(long, default_value_t = false)]
+    diff_last: bool,
+
+    /// Specific scan UUIDs to compare (--diff <SCAN_ID_A> <SCAN_ID_B>)
+    #[arg(long, num_args = 2)]
+    diff: Option<Vec<String>>,
+
     /// Export scan observations to JSON file
     #[arg(long)]
     export_json: Option<String>,
@@ -62,6 +72,10 @@ struct Args {
     /// Export scan observations to CSV file
     #[arg(long)]
     export_csv: Option<String>,
+
+    /// Export scan diff analysis to JSON file
+    #[arg(long)]
+    export_diff_json: Option<String>,
 
     /// SQLite database storage file
     #[arg(long, default_value = "recon_data.db")]
@@ -85,7 +99,7 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.9.0...");
+    println!("🚀 Starting Async Recon Engine v1.0.0...");
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
@@ -99,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.9.0")
+        .user_agent("recon_test/1.0.0")
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -147,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 6. Create ScanRun session
-    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.9.0".to_string());
+    let mut scan_run = ScanRun::new(root_scope.clone(), "v1.0.0".to_string());
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
@@ -479,6 +493,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scan_run.id,
                 csv_path
             );
+        }
+    }
+
+    // 13. Handle Scan-to-Scan Diffing Engine Analysis
+    let diff_run_ids = if args.diff_last {
+        if let Ok(Some((prev_run, curr_run))) = db::get_last_two_scan_runs(&conn) {
+            Some((prev_run.id, curr_run.id))
+        } else {
+            println!("ℹ️  Not enough historical ScanRuns found to perform auto-diff.");
+            None
+        }
+    } else if let Some(ref diff_args) = args.diff {
+        if diff_args.len() == 2 {
+            let id_a = Uuid::parse_str(&diff_args[0]).ok();
+            let id_b = Uuid::parse_str(&diff_args[1]).ok();
+            if let (Some(a), Some(b)) = (id_a, id_b) {
+                Some((a, b))
+            } else {
+                eprintln!("❌ Invalid UUID parameters supplied for --diff.");
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((id_a, id_b)) = diff_run_ids {
+        println!("\n📊 Calculating Scan Diff Analysis (Scan A: {} ➔ Scan B: {})...", id_a, id_b);
+        match diff::compare_scan_runs(&conn, &id_a, &id_b) {
+            Ok(diff_result) => {
+                println!("  [+] Added Subdomains ({}): {:?}", diff_result.new_subdomains.len(), diff_result.new_subdomains);
+                println!("  [-] Removed Subdomains ({}): {:?}", diff_result.removed_subdomains.len(), diff_result.removed_subdomains);
+                println!("  [Δ] Status Changes ({}):", diff_result.status_changes.len());
+                for sc in &diff_result.status_changes {
+                    println!("      - {:<24} : {:?} ➔ {:?}", sc.hostname, sc.old_status, sc.new_status);
+                }
+                println!("  [Δ] DNS IP Changes ({}):", diff_result.ip_changes.len());
+                for ipc in &diff_result.ip_changes {
+                    println!("      - {:<24} : {:?} ➔ {:?}", ipc.hostname, ipc.old_ips, ipc.new_ips);
+                }
+                println!("  [+] New Technologies Detected ({}): {:?}", diff_result.new_technologies.len(), diff_result.new_technologies);
+
+                if let Some(diff_json_path) = args.export_diff_json {
+                    exporter::export_diff_json(&diff_result, &diff_json_path)?;
+                    println!("💾 Exported ScanDiff observations to JSON: '{}'", diff_json_path);
+                }
+            }
+            Err(e) => eprintln!("❌ Failed to calculate scan diff: {}", e),
         }
     }
 
