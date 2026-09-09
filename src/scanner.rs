@@ -128,20 +128,3 @@ pub async fn probe_subdomain(
         }
     }
 }
-
-pub async fn resolve_ip(subdomain: &str) -> Option<String> {
-    let clean_host = subdomain
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()?;
-
-    let addr_str = format!("{}:80", clean_host);
-    if let Ok(mut addrs) = tokio::net::lookup_host(&addr_str).await {
-        if let Some(addr) = addrs.next() {
-            return Some(addr.ip().to_string());
-        }
-    }
-
-    None
-}

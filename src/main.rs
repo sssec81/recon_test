@@ -1,4 +1,5 @@
 mod db;
+mod dns;
 mod exporter;
 mod models;
 mod normalize;
@@ -7,7 +8,8 @@ mod scanner;
 mod scope;
 
 use clap::Parser;
-use models::{DiscoverySource, DnsRecord, Hostname, HttpObservation, ScanRun};
+use dns::AsyncDnsResolver;
+use models::{DiscoverySource, Hostname, HttpObservation, ScanRun};
 use pipeline::{ReconEvent, Scheduler, WorkItem};
 use scanner::SchemeStrategy;
 use scope::ScopePolicy;
@@ -18,9 +20,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Engine v0.5.0
+/// Async Bug Bounty Subdomain Recon Engine v0.6.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.5.0", about = "Async Rust Recon Engine with Scheduler, Event Bus, Normalizer & Scope Engine")]
+#[command(author, version = "0.6.0", about = "Async Rust Recon Engine with Hickory DNS & Wildcard Catch-All Detection")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -72,14 +74,17 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.5.0...");
+    println!("🚀 Starting Async Recon Engine v0.6.0...");
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
     let db_tx = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
 
-    // 2. Determine raw target inputs
+    // 2. Initialize Async DNS Resolver
+    let dns_resolver = AsyncDnsResolver::new();
+
+    // 3. Determine raw target inputs
     let raw_targets = if let Some(single_target) = args.target {
         vec![single_target]
     } else if let Some(ref file_path) = args.file {
@@ -102,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ]
     };
 
-    // 3. Initialize Scope Policy & Work Scheduler
+    // 4. Initialize Scope Policy & Work Scheduler
     let root_scope = if !args.scope.is_empty() {
         args.scope.clone()
     } else {
@@ -115,12 +120,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scheduler = Scheduler::new(scope_policy, work_tx);
 
-    // 4. Create ScanRun session
-    let mut scan_run = ScanRun::new(root_scope, "v0.5.0".to_string());
+    // 5. Check Wildcard DNS on root scope domains
+    for root_domain in &root_scope {
+        if dns_resolver.is_wildcard_domain(root_domain).await {
+            println!("⚠️  Wildcard DNS catch-all detected for domain: '{}'", root_domain);
+        }
+    }
+
+    // 6. Create ScanRun session
+    let mut scan_run = ScanRun::new(root_scope, "v0.6.0".to_string());
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
-    // 5. Submit raw target inputs to Scheduler (Normalizes & Scope Checks & Deduplicates)
+    // 7. Submit raw target inputs to Scheduler
     let mut queued_count = 0;
     for raw in &raw_targets {
         if scheduler.submit_raw_target(raw).await {
@@ -133,17 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queued_count, args.scheme_strategy
     );
 
-    // 6. Shared HTTP Client with connection pooling
+    // 8. Shared HTTP Client with connection pooling
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.5.0")
+        .user_agent("recon_test/0.6.0")
         .danger_accept_invalid_certs(true)
         .build()?;
 
-    // 7. Event Bus Processor Task
+    // 9. Event Bus Processor Task
     let db_channel = db_tx.clone();
     let event_processor_handle = tokio::spawn(async move {
         let mut pending_bundles: std::collections::HashMap<String, db::ObservationBundle> =
@@ -220,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 8. Work Scheduler Dispatcher Loop
+    // 10. Work Scheduler Dispatcher Loop
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut set = JoinSet::new();
 
@@ -229,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             WorkItem::ProbeTarget { hostname } => {
                 let sem = Arc::clone(&semaphore);
                 let client = http_client.clone();
+                let resolver = dns_resolver.clone();
                 let strategy = args.scheme_strategy;
                 let scan_id = scan_run.id;
                 let bus = event_tx.clone();
@@ -242,18 +255,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         source: DiscoverySource::Seed,
                     }).await;
 
-                    // Resolve DNS & emit DnsResolved event
-                    let ip_opt = scanner::resolve_ip(hostname.as_str()).await;
-                    let mut dns_records = Vec::new();
-                    if let Some(ref ip) = ip_opt {
-                        let rec_type = if ip.contains(':') { "AAAA" } else { "A" };
-                        dns_records.push(DnsRecord::new(
-                            hostname.as_str().to_string(),
-                            rec_type.to_string(),
-                            ip.clone(),
-                            Some(300),
-                        ));
-                    }
+                    // Resolve multi-record DNS asynchronously
+                    let dns_records = resolver.resolve_all(hostname.as_str()).await;
                     let _ = bus.send(ReconEvent::DnsResolved {
                         hostname: hostname.clone(),
                         records: dns_records,
@@ -279,7 +282,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Break loop when work channel drains
         if work_rx.is_empty() {
             break;
         }
@@ -296,13 +298,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(db_tx);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 9. Complete ScanRun session
+    // 11. Complete ScanRun session
     scan_run.complete();
     db::finish_scan_run(&conn, &scan_run.id)?;
 
     println!("🎉 ScanRun {} completed successfully!", scan_run.id);
 
-    // 10. Handle Data Export if requested
+    // 12. Handle Data Export if requested
     if args.export_json.is_some() || args.export_csv.is_some() {
         let scan_observations = db::get_scan_observations(&conn, &scan_run.id)?;
 
