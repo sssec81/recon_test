@@ -1,6 +1,6 @@
 [package]
 name = "recon_test"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
@@ -15,3 +15,6 @@ futures-util = "0.3"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hickory-resolver = "0.24"
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+x509-parser = "0.16"

@@ -1,4 +1,4 @@
-use crate::models::{DiscoverySource, DnsRecord, HttpObservation};
+use crate::models::{DiscoverySource, DnsRecord, HttpObservation, ServiceRecord, TlsRecord};
 use crate::normalize::NormalizedHostname;
 use crate::scope::ScopePolicy;
 use std::collections::HashSet;
@@ -22,6 +22,14 @@ pub enum ReconEvent {
     DnsResolved {
         hostname: NormalizedHostname,
         records: Vec<DnsRecord>,
+    },
+    ServiceObserved {
+        hostname: NormalizedHostname,
+        services: Vec<ServiceRecord>,
+    },
+    TlsObserved {
+        hostname: NormalizedHostname,
+        tls_record: TlsRecord,
     },
     HttpObserved(HttpObservation),
 }
@@ -55,7 +63,6 @@ impl Scheduler {
         {
             let mut seen = self.seen_hostnames.lock().unwrap();
             if !seen.insert(norm.clone()) {
-                // Deduplicated
                 return false;
             }
         }

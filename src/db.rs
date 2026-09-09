@@ -1,4 +1,6 @@
-use crate::models::{DnsRecord, Hostname, HttpObservation, ScanRun};
+use crate::models::{
+    DnsRecord, Hostname, HttpObservation, ScanRun, ServiceRecord, TlsRecord,
+};
 use rusqlite::{params, Connection, Result};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -50,7 +52,35 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    // 4. HTTP Observations table
+    // 4. Services table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS services (
+            id TEXT PRIMARY KEY,
+            hostname TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            protocol TEXT NOT NULL,
+            is_open BOOLEAN NOT NULL,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(hostname) REFERENCES hostnames(name)
+        )",
+        [],
+    )?;
+
+    // 5. TLS Certificates table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tls_certificates (
+            id TEXT PRIMARY KEY,
+            service_id TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            subject_ans TEXT NOT NULL,
+            expires_at TEXT,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(service_id) REFERENCES services(id)
+        )",
+        [],
+    )?;
+
+    // 6. HTTP Observations table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS http_observations (
             id TEXT PRIMARY KEY,
@@ -100,6 +130,8 @@ pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
 pub struct ObservationBundle {
     pub hostname: Hostname,
     pub dns_records: Vec<DnsRecord>,
+    pub services: Vec<ServiceRecord>,
+    pub tls_record: Option<TlsRecord>,
     pub http_observation: HttpObservation,
 }
 
@@ -113,6 +145,16 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
 
         let mut stmt_dns = tx.prepare(
             "INSERT OR REPLACE INTO dns_records (id, hostname_id, record_type, value, ttl, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
+        let mut stmt_svc = tx.prepare(
+            "INSERT OR REPLACE INTO services (id, hostname, port, protocol, is_open, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
+        let mut stmt_tls = tx.prepare(
+            "INSERT OR REPLACE INTO tls_certificates (id, service_id, issuer, subject_ans, expires_at, observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
 
@@ -140,6 +182,31 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                     dns.value,
                     dns.ttl,
                     dns.observed_at.to_rfc3339(),
+                ])?;
+            }
+
+            // Save Services
+            for svc in &bundle.services {
+                stmt_svc.execute(params![
+                    svc.id,
+                    svc.hostname,
+                    svc.port as i32,
+                    svc.protocol,
+                    svc.is_open,
+                    svc.observed_at.to_rfc3339(),
+                ])?;
+            }
+
+            // Save TLS Certificate
+            if let Some(ref tls) = bundle.tls_record {
+                let ans_json = serde_json::to_string(&tls.subject_ans).unwrap_or_default();
+                stmt_tls.execute(params![
+                    tls.id,
+                    tls.service_id,
+                    tls.issuer,
+                    ans_json,
+                    tls.expires_at,
+                    tls.observed_at.to_rfc3339(),
                 ])?;
             }
 

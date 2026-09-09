@@ -94,6 +94,59 @@ impl DnsRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    pub id: String,
+    pub hostname: String,
+    pub port: u16,
+    pub protocol: String,
+    pub is_open: bool,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl ServiceRecord {
+    pub fn new(hostname: String, port: u16, protocol: String, is_open: bool) -> Self {
+        let id = format!("{}:{}:{}", hostname, port, protocol);
+        Self {
+            id,
+            hostname,
+            port,
+            protocol,
+            is_open,
+            observed_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsRecord {
+    pub id: String,
+    pub service_id: String,
+    pub issuer: String,
+    pub subject_ans: Vec<String>,
+    pub expires_at: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl TlsRecord {
+    pub fn new(
+        service_id: String,
+        issuer: String,
+        subject_ans: Vec<String>,
+        expires_at: Option<String>,
+    ) -> Self {
+        let id = format!("{}:tls", service_id);
+        Self {
+            id,
+            service_id,
+            issuer,
+            subject_ans,
+            expires_at,
+            observed_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpObservation {
     pub id: Uuid,
     pub scan_id: Uuid,

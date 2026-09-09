@@ -7,10 +7,12 @@ mod normalize;
 mod pipeline;
 mod scanner;
 mod scope;
+mod services;
+mod tls;
 
 use clap::Parser;
 use dns::AsyncDnsResolver;
-use models::{DiscoverySource, Hostname, HttpObservation, ScanRun};
+use models::{DiscoverySource, Hostname, HttpObservation, ScanRun, ServiceRecord, TlsRecord};
 use pipeline::{ReconEvent, Scheduler, WorkItem};
 use scanner::SchemeStrategy;
 use scope::ScopePolicy;
@@ -21,9 +23,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
-/// Async Bug Bounty Subdomain Recon Engine v0.7.0
+/// Async Bug Bounty Subdomain Recon Engine v0.8.0
 #[derive(Parser, Debug)]
-#[command(author, version = "0.7.0", about = "Async Rust Recon Engine with Passive CT Log Ingestion & Feedback Loop")]
+#[command(author, version = "0.8.0", about = "Async Rust Recon Engine with TCP Service Port Scanner & TLS SAN Feedback Loop")]
 struct Args {
     /// Single target subdomain to probe
     #[arg(short, long)]
@@ -79,7 +81,7 @@ fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🚀 Starting Async Recon Engine v0.7.0...");
+    println!("🚀 Starting Async Recon Engine v0.8.0...");
 
     // 1. Initialize SQLite Database & start WAL writer channel
     let conn = db::init_db(&args.db)?;
@@ -93,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_max_idle_per_host(10)
-        .user_agent("recon_test/0.7.0")
+        .user_agent("recon_test/0.8.0")
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -141,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 6. Create ScanRun session
-    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.7.0".to_string());
+    let mut scan_run = ScanRun::new(root_scope.clone(), "v0.8.0".to_string());
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
@@ -181,6 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Event Bus Processor Task
     let db_channel = db_tx.clone();
+    let scheduler_clone = scheduler.clone();
+
     let event_processor_handle = tokio::spawn(async move {
         let mut pending_bundles: std::collections::HashMap<String, db::ObservationBundle> =
             std::collections::HashMap::new();
@@ -205,6 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         db::ObservationBundle {
                             hostname: host_entity,
                             dns_records: Vec::new(),
+                            services: Vec::new(),
+                            tls_record: None,
                             http_observation: dummy_http,
                         },
                     );
@@ -213,6 +219,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let name = hostname.as_str().to_string();
                     if let Some(bundle) = pending_bundles.get_mut(&name) {
                         bundle.dns_records.extend(records);
+                    }
+                }
+                ReconEvent::ServiceObserved { hostname, services } => {
+                    let name = hostname.as_str().to_string();
+                    if let Some(bundle) = pending_bundles.get_mut(&name) {
+                        bundle.services.extend(services);
+                    }
+                }
+                ReconEvent::TlsObserved { hostname, tls_record } => {
+                    let name = hostname.as_str().to_string();
+
+                    // TLS SAN Feedback Loop: feed SAN subdomains back into Scheduler
+                    for san_domain in &tls_record.subject_ans {
+                        scheduler_clone
+                            .submit_target_with_source(san_domain, DiscoverySource::TlsSan)
+                            .await;
+                    }
+
+                    if let Some(bundle) = pending_bundles.get_mut(&name) {
+                        bundle.tls_record = Some(tls_record);
                     }
                 }
                 ReconEvent::HttpObserved(obs) => {
@@ -247,6 +273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let bundle = db::ObservationBundle {
                             hostname: host_entity,
                             dns_records: Vec::new(),
+                            services: Vec::new(),
+                            tls_record: None,
                             http_observation: obs,
                         };
                         let _ = db_channel.send(bundle).await;
@@ -273,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set.spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
 
-                    // Emit HostnameDiscovered event with DiscoverySource attribution
+                    // Emit HostnameDiscovered event
                     let _ = bus
                         .send(ReconEvent::HostnameDiscovered {
                             hostname: hostname.clone(),
@@ -289,6 +317,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             records: dns_records,
                         })
                         .await;
+
+                    // Perform TCP Port Scan on default web ports
+                    let open_ports = services::probe_open_ports(hostname.as_str(), services::DEFAULT_PORTS).await;
+                    let service_records: Vec<ServiceRecord> = open_ports
+                        .iter()
+                        .map(|&port| ServiceRecord::new(hostname.as_str().to_string(), port, "tcp".to_string(), true))
+                        .collect();
+
+                    let _ = bus
+                        .send(ReconEvent::ServiceObserved {
+                            hostname: hostname.clone(),
+                            services: service_records,
+                        })
+                        .await;
+
+                    // Fetch TLS Certificate & SANs if port 443 or 8443 is open
+                    if open_ports.contains(&443) || open_ports.contains(&8443) {
+                        let tls_port = if open_ports.contains(&443) { 443 } else { 8443 };
+                        let host_str = hostname.as_str().to_string();
+                        let tls_info_opt = tokio::task::spawn_blocking(move || {
+                            tls::fetch_tls_info(&host_str, tls_port)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                        if let Some(tls_info) = tls_info_opt {
+                            let service_id = format!("{}:{}:tcp", hostname.as_str(), tls_port);
+                            let tls_rec = TlsRecord::new(
+                                service_id,
+                                tls_info.issuer,
+                                tls_info.san_domains,
+                                tls_info.expires_at,
+                            );
+
+                            let _ = bus
+                                .send(ReconEvent::TlsObserved {
+                                    hostname: hostname.clone(),
+                                    tls_record: tls_rec,
+                                })
+                                .await;
+                        }
+                    }
 
                     // Perform HTTP Probe & emit HttpObserved event
                     let scan = scanner::probe_subdomain(&client, hostname.as_str(), strategy).await;
