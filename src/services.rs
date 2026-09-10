@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -14,11 +15,12 @@ pub async fn probe_port(host: &str, port: u16) -> bool {
 }
 
 pub async fn probe_open_ports(host: &str, ports: &[u16]) -> Vec<u16> {
-    let mut open_ports = Vec::new();
-    for &port in ports {
-        if probe_port(host, port).await {
-            open_ports.push(port);
+    let futs = ports.iter().map(|&p| async move {
+        if probe_port(host, p).await {
+            Some(p)
+        } else {
+            None
         }
-    }
-    open_ports
+    });
+    join_all(futs).await.into_iter().flatten().collect()
 }

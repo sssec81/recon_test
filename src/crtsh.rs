@@ -20,13 +20,14 @@ pub async fn query_crtsh(client: &Client, domain: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let url = format!("https://crt.sh/?q=%.{}&output=json", clean_domain);
+    let query_val = format!("%.{}", clean_domain);
     let mut discovered = HashSet::new();
     let max_attempts = 3;
 
     for attempt in 1..=max_attempts {
         let req_res = client
-            .get(&url)
+            .get("https://crt.sh/")
+            .query(&[("q", &query_val), ("output", &"json".to_string())])
             .header("User-Agent", "recon_test/1.0.0")
             .timeout(Duration::from_secs(12))
             .send()

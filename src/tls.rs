@@ -10,6 +10,11 @@ pub struct TlsCertificateInfo {
     pub san_domains: Vec<String>,
 }
 
+/// Fetches TLS certificate metadata and Subject Alternative Names (SANs) for a given host:port.
+///
+/// Note: Uses `danger_accept_invalid_certs(true)` because bug bounty target endpoints
+/// often present self-signed, expired, or staging TLS certificates whose SAN domains
+/// are still valuable for attack surface discovery.
 pub fn fetch_tls_info(hostname: &str, port: u16) -> Option<TlsCertificateInfo> {
     let connector = TlsConnector::builder()
         .danger_accept_invalid_certs(true)

@@ -38,12 +38,6 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    // Migration for existing v1.0.0 databases missing scan_id in dns_records
-    let _ = conn.execute(
-        "ALTER TABLE dns_records ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-
     // 3. DNS Records table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dns_records (
@@ -59,6 +53,12 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         )",
         [],
     )?;
+
+    // Migration for existing v1.0.0 databases missing scan_id in dns_records
+    let _ = conn.execute(
+        "ALTER TABLE dns_records ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
 
     // 4. Services table
     conn.execute(
