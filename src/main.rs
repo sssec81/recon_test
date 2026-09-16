@@ -66,9 +66,13 @@ struct Args {
     #[arg(long, num_args = 2)]
     diff: Option<Vec<String>>,
 
-    /// Enable local AI attack surface analysis via Ollama
+    /// Enable AI attack surface analysis
     #[arg(long, default_value_t = false)]
     llm_analyze: bool,
+
+    /// LLM backend provider for AI analysis
+    #[arg(long, value_enum, default_value_t = LlmBackend::Ollama)]
+    llm_backend: LlmBackend,
 
     /// Ollama model name to use for local AI analysis
     #[arg(long, default_value = "llama3:8b")]
@@ -77,6 +81,18 @@ struct Args {
     /// Ollama server base URL endpoint
     #[arg(long, default_value = "http://localhost:11434")]
     ollama_url: String,
+
+    /// Anthropic API key (or set ANTHROPIC_API_KEY environment variable)
+    #[arg(long, env = "ANTHROPIC_API_KEY")]
+    anthropic_api_key: Option<String>,
+
+    /// Anthropic model name to use for cloud AI analysis
+    #[arg(long, default_value = "claude-3-5-haiku-20241022")]
+    anthropic_model: String,
+
+    /// Maximum completion tokens for LLM analysis
+    #[arg(long, default_value_t = 1024)]
+    llm_max_tokens: u32,
 
     /// Export scan observations to JSON file
     #[arg(long)]
@@ -93,6 +109,12 @@ struct Args {
     /// SQLite database storage file
     #[arg(long, default_value = "recon_data.db")]
     db: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LlmBackend {
+    Ollama,
+    Anthropic,
 }
 
 fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
@@ -574,36 +596,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 14. Local AI Attack Surface Analysis via Ollama (if requested)
+    // 14. AI Attack Surface Analysis (if requested)
     if args.llm_analyze {
-        let scan_observations = db::get_scan_observations(&conn, &scan_run.id)?;
-        println!(
-            "\n🤖 Generating Local AI Attack Surface Assessment via Ollama ({}) at '{}'...",
-            args.ollama_model, args.ollama_url
-        );
-
-        match llm::analyze_scan_observations(&http_client, &args.ollama_url, &args.ollama_model, &scan_observations).await {
-            Ok(ai_summary) => {
-                println!("\n=== 🤖 Local AI Attack Surface Assessment ===");
-                println!("{}", ai_summary.trim());
-                println!("=============================================");
+        let provider = match args.llm_backend {
+            LlmBackend::Ollama => llm::LlmProvider::Ollama {
+                url: args.ollama_url.clone(),
+                model: args.ollama_model.clone(),
+            },
+            LlmBackend::Anthropic => {
+                if let Some(key) = args.anthropic_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    llm::LlmProvider::Anthropic {
+                        api_key: key.clone(),
+                        model: args.anthropic_model.clone(),
+                        max_tokens: args.llm_max_tokens,
+                    }
+                } else {
+                    eprintln!("❌ Error: ANTHROPIC_API_KEY is required when --llm-backend is set to 'anthropic'. Set ANTHROPIC_API_KEY env var or pass --anthropic-api-key.");
+                    return Err("Missing ANTHROPIC_API_KEY".into());
+                }
             }
-            Err(e) => eprintln!("⚠️  Local LLM analysis failed: {}", e),
+        };
+
+        let scan_observations = db::get_scan_observations(&conn, &scan_run.id)?;
+        let backend_name = match &provider {
+            llm::LlmProvider::Ollama { model, url } => format!("Ollama ({}) at '{}'", model, url),
+            llm::LlmProvider::Anthropic { model, .. } => format!("Anthropic Claude ({})", model),
+        };
+        println!("\n🤖 Generating AI Attack Surface Assessment via {}...", backend_name);
+
+        match llm::analyze_scan_observations(&http_client, &provider, &scan_observations).await {
+            Ok(ai_summary) => {
+                println!("\n=== 🤖 AI Attack Surface Assessment ===");
+                println!("{}", ai_summary.trim());
+                println!("======================================");
+            }
+            Err(e) => eprintln!("⚠️  AI analysis failed: {}", e),
         }
 
         if let Some((id_a, id_b)) = diff_run_ids {
             if let Ok(diff_result) = diff::compare_scan_runs(&conn, &id_a, &id_b) {
-                println!(
-                    "\n🤖 Generating Local AI Scan Diff Threat Assessment via Ollama ({}) ...",
-                    args.ollama_model
-                );
-                match llm::analyze_scan_diff(&http_client, &args.ollama_url, &args.ollama_model, &diff_result).await {
+                println!("\n🤖 Generating AI Scan Diff Threat Assessment via {}...", backend_name);
+                match llm::analyze_scan_diff(&http_client, &provider, &diff_result).await {
                     Ok(diff_ai_summary) => {
-                        println!("\n=== 🤖 Local AI Scan Diff Assessment ===");
+                        println!("\n=== 🤖 AI Scan Diff Assessment ===");
                         println!("{}", diff_ai_summary.trim());
-                        println!("========================================");
+                        println!("=================================");
                     }
-                    Err(e) => eprintln!("⚠️  Local LLM diff analysis failed: {}", e),
+                    Err(e) => eprintln!("⚠️  AI diff analysis failed: {}", e),
                 }
             }
         }
