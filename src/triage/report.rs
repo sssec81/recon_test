@@ -25,12 +25,22 @@ pub fn write_review(
         if let Some(control) = &finding.control {
             write_json(&evidence_dir.join("control.json"), control)?;
         }
+        for (repeat_index, repeat) in finding.control_repeats.iter().enumerate() {
+            write_json(
+                &evidence_dir.join(format!("control-repeat-{:02}.json", repeat_index + 1)),
+                repeat,
+            )?;
+        }
         finding.evidence_dir = Some(evidence_dir.to_string_lossy().to_string());
         write_json(&evidence_dir.join("metadata.json"), finding)?;
     }
     write_json(&run_dir.join("review.json"), queue)?;
     write_json(&run_dir.join("endpoints.json"), &endpoints)?;
     write_json(&run_dir.join("anomalies.json"), &anomalies)?;
+    write_json(
+        &run_dir.join("suppressed.json"),
+        &queue.suppressed_candidates,
+    )?;
     fs::write(run_dir.join("review.md"), render_markdown(queue))?;
     Ok(run_dir)
 }
@@ -45,7 +55,7 @@ fn write_json(
 
 fn render_markdown(queue: &ReviewQueue) -> String {
     let mut output = format!(
-        "# Recon review queue\n\nScan: `{}`\n\nPages crawled: {} · Requests: {} · Endpoints: {} · Response anomalies: {} · Candidates: {} · Suppressed: {} · Budget exhausted: {}\n\n",
+        "# Recon review queue\n\nScan: `{}`\n\nPages crawled: {} · Requests: {} · Endpoints: {} · Response anomalies: {} · Candidates: {} · Suppressed: {} · Duplicates: {} · Budget exhausted: {}\n\n",
         queue.scan_id,
         queue.pages_crawled,
         queue.requests_sent,
@@ -53,10 +63,16 @@ fn render_markdown(queue: &ReviewQueue) -> String {
         queue.response_anomalies,
         queue.candidates_found,
         queue.findings_suppressed,
+        queue.duplicates_removed,
         queue.budget_exhausted,
     );
     if queue.findings.is_empty() {
         output.push_str("No evidence-backed candidates reached the review threshold.\n");
+    }
+    if !queue.suppressed_candidates.is_empty() {
+        output.push_str(
+            "Rejected or incomplete candidates and their reasons are in `suppressed.json`.\n\n",
+        );
     }
     for (index, finding) in queue.findings.iter().enumerate() {
         append_finding(&mut output, index + 1, finding);
@@ -71,14 +87,10 @@ fn append_finding(output: &mut String, index: usize, finding: &Finding) {
         finding.false_positive_notes, finding.manual_validation,
     ));
     output.push_str(&format!(
-        "**Evidence:** baseline status {:?}, {} repeat(s), control {}. Saved at `{}`.\n\n",
+        "**Evidence:** baseline status {:?}, {} baseline repeat(s), {} control check(s). Saved at `{}`.\n\n",
         finding.baseline.status,
         finding.repeats.len(),
-        if finding.control.is_some() {
-            "recorded"
-        } else {
-            "not run"
-        },
+        usize::from(finding.control.is_some()) + finding.control_repeats.len(),
         finding.evidence_dir.as_deref().unwrap_or(""),
     ));
 }
@@ -99,6 +111,8 @@ mod tests {
             findings: vec![],
             endpoints_discovered: 0,
             response_anomalies: 0,
+            suppressed_candidates: vec![],
+            duplicates_removed: 0,
         };
         assert!(render_markdown(&queue).contains("No evidence-backed candidates"));
     }

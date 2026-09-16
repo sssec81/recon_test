@@ -47,7 +47,15 @@ pub struct Finding {
     pub baseline: HttpEvidence,
     pub repeats: Vec<HttpEvidence>,
     pub control: Option<HttpEvidence>,
+    pub control_repeats: Vec<HttpEvidence>,
     pub evidence_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuppressedCandidate {
+    pub category: String,
+    pub endpoint: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +69,8 @@ pub struct ReviewQueue {
     pub findings: Vec<Finding>,
     pub endpoints_discovered: usize,
     pub response_anomalies: usize,
+    pub suppressed_candidates: Vec<SuppressedCandidate>,
+    pub duplicates_removed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,4 +93,6 @@ pub struct ResponseAnomaly {
     pub control_status: u16,
     pub baseline_content_type: Option<String>,
     pub control_content_type: Option<String>,
+    pub baseline_evidence: HttpEvidence,
+    pub control_evidence: HttpEvidence,
 }

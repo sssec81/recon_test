@@ -1,6 +1,6 @@
 use crate::scan::scope::ScopePolicy;
 use crate::triage::crawl::{extract_js_calls, extract_links, is_html, is_safe_url, script_text};
-use crate::triage::model::{EndpointRecord, Page, ResponseAnomaly};
+use crate::triage::model::{EndpointRecord, HttpEvidence, Page, ResponseAnomaly};
 use reqwest::Url;
 use scraper::{Html, Selector};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +17,7 @@ struct ObservedResponse {
     url: String,
     status: u16,
     content_type: Option<String>,
+    evidence: HttpEvidence,
 }
 
 fn route_template(url: &Url) -> String {
@@ -107,6 +108,7 @@ impl Inventory {
                     url: url.to_string(),
                     status,
                     content_type: page.evidence.content_type.clone(),
+                    evidence: page.evidence.clone(),
                 });
         }
         for link in extract_links(page, url, scope) {
@@ -168,6 +170,8 @@ impl Inventory {
                     control_status: success.status,
                     baseline_content_type: failure.content_type.clone(),
                     control_content_type: success.content_type.clone(),
+                    baseline_evidence: failure.evidence.clone(),
+                    control_evidence: success.evidence.clone(),
                 });
             }
         }
