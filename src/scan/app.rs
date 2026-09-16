@@ -1,7 +1,7 @@
-use crate::cli::{self, Args};
+use crate::cli::{self, Args, LlmBackend};
 use crate::probes::crtsh;
 use crate::probes::dns::AsyncDnsResolver;
-use crate::report::reporting;
+use crate::report::{llm, reporting};
 use crate::scan::events;
 use crate::scan::pipeline::{ReconEvent, Scheduler, WorkItem};
 use crate::scan::scope::ScopePolicy;
@@ -241,7 +241,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .user_agent("recon_test/1.0.0")
             .danger_accept_invalid_certs(true)
             .build()?;
-        triage::run(
+        let review = triage::run(
             &triage_client,
             &scope,
             &observations,
@@ -249,6 +249,45 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             scan_run.id,
         )
         .await?;
+        if args.llm_analyze {
+            let provider = match args.llm_backend {
+                LlmBackend::Ollama => Some(llm::LlmProvider::Ollama {
+                    url: args.ollama_url.clone(),
+                    model: args.ollama_model.clone(),
+                }),
+                LlmBackend::Anthropic => args
+                    .anthropic_api_key
+                    .as_ref()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(|key| llm::LlmProvider::Anthropic {
+                        api_key: key.clone(),
+                        model: args.anthropic_model.clone(),
+                        max_tokens: args.llm_max_tokens,
+                    }),
+            };
+            if let Some(provider) = provider {
+                println!("🤖 Analyzing verified review candidates with AI...");
+                match triage::ai::analyze(&http_client, &provider, &review).await {
+                    Ok(result) => {
+                        match triage::ai::write(&result, std::path::Path::new(&args.triage_dir)) {
+                            Ok(()) => println!("🤖 AI suggestions saved for {} finding(s).", result.analyzed_findings),
+                            Err(error) => eprintln!("⚠️  Could not save candidate AI triage: {error}"),
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("⚠️  Candidate AI triage unavailable: {error}");
+                        if let Err(write_error) = triage::ai::write_unavailable(review.scan_id, std::path::Path::new(&args.triage_dir)) {
+                            eprintln!("⚠️  Could not save AI triage status: {write_error}");
+                        }
+                    }
+                }
+            } else {
+                eprintln!("⚠️  Candidate AI triage skipped: ANTHROPIC_API_KEY is missing.");
+                if let Err(error) = triage::ai::write_unavailable(review.scan_id, std::path::Path::new(&args.triage_dir)) {
+                    eprintln!("⚠️  Could not save AI triage status: {error}");
+                }
+            }
+        }
     }
 
     reporting::report(args, &conn, &scan_run, &http_client).await

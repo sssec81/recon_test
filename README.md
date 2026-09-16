@@ -48,7 +48,7 @@ cargo build --release
 | `--scheme-strategy <STRATEGY>` | Probing scheme (`https-first`, `https-only`, `both-parallel`) | `https-first` |
 | `--diff-last` | Diff against the previous compatible finished run | `false` |
 | `--diff <UUID_A> <UUID_B>` | Compare specific historical scan runs | None |
-| `--llm-analyze` | Enable optional AI attack surface analysis | `false` |
+| `--llm-analyze` | Enable optional AI analysis; with `--triage`, analyze verified review candidates only | `false` |
 | `--ollama-model <MODEL>` | Local Ollama model name | `llama3:8b` |
 | `--ollama-url <URL>` | Local Ollama API endpoint | `http://localhost:11434` |
 | `--llm-backend <BACKEND>` | AI backend (`ollama` or `anthropic`) | `ollama` |
@@ -88,7 +88,9 @@ cargo run --release -- -t example.com --scope example.com --passive false --tria
 
 Triage starts after recon. Its time and request limits apply to the triage phase only. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, `endpoints.json`, `anomalies.json`, `suppressed.json`, and `evidence/`. The endpoint inventory records route templates, query and form field names, discovery sources, observed statuses, and content types. `suppressed.json` records candidates rejected by repeat or control checks, budget limits, and the review queue cap. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
 
-Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation. `--llm-analyze` is skipped when `--triage` is enabled because candidate-only AI triage is planned for a later phase.
+Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation.
+
+Add `--llm-analyze` to a triage run to request one optional AI review of up to five verified findings. The model receives only finding IDs, categories, sanitized route paths, query parameter names, status and content type, and repeat/control counts. Full URLs, query values, response bodies, titles, hashes, and headers are not sent. AI suggestions are saved in `ai_triage.json` and `ai_triage.md`; they cannot change scanner confidence, add findings, or trigger HTTP checks. Ollama is the default local backend. Use `--llm-backend anthropic` and `ANTHROPIC_API_KEY` for cloud analysis. If AI fails, the deterministic review queue remains available.
 
 ### Rescan, auto-diff against previous run, and generate AI diff analysis:
 ```bash

@@ -135,6 +135,21 @@ async fn analyze_with_anthropic(
     }
 }
 
+pub async fn generate_text(
+    client: &Client,
+    provider: &LlmProvider,
+    prompt: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match provider {
+        LlmProvider::Ollama { url, model } => analyze_with_ollama(client, url, model, prompt).await,
+        LlmProvider::Anthropic {
+            api_key,
+            model,
+            max_tokens,
+        } => analyze_with_anthropic(client, api_key, model, *max_tokens, prompt).await,
+    }
+}
+
 pub async fn analyze_scan_observations(
     client: &Client,
     provider: &LlmProvider,
@@ -176,16 +191,7 @@ pub async fn analyze_scan_observations(
         obs_summary
     );
 
-    match provider {
-        LlmProvider::Ollama { url, model } => {
-            analyze_with_ollama(client, url, model, &prompt).await
-        }
-        LlmProvider::Anthropic {
-            api_key,
-            model,
-            max_tokens,
-        } => analyze_with_anthropic(client, api_key, model, *max_tokens, &prompt).await,
-    }
+    generate_text(client, provider, &prompt).await
 }
 
 pub async fn analyze_scan_diff(
@@ -230,14 +236,5 @@ pub async fn analyze_scan_diff(
         diff.new_technologies
     );
 
-    match provider {
-        LlmProvider::Ollama { url, model } => {
-            analyze_with_ollama(client, url, model, &prompt).await
-        }
-        LlmProvider::Anthropic {
-            api_key,
-            model,
-            max_tokens,
-        } => analyze_with_anthropic(client, api_key, model, *max_tokens, &prompt).await,
-    }
+    generate_text(client, provider, &prompt).await
 }

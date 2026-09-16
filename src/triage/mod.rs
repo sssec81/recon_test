@@ -1,3 +1,4 @@
+pub mod ai;
 mod crawl;
 mod detect;
 mod inventory;
