@@ -2,15 +2,25 @@
 
 An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqwest`, `rusqlite`, and `clap`.
 
+## Code layout
+
+| Directory | Responsibility |
+| --- | --- |
+| `src/main.rs`, `src/cli.rs` | Entry point, CLI arguments, and target file loading |
+| `src/scan/` | Scan coordination, scheduling, per-host work, event assembly, and scope checks |
+| `src/probes/` | Certificate, DNS, TCP, TLS, HTTP, and technology probes |
+| `src/storage/` | Observation models and SQLite persistence |
+| `src/report/` | Scan comparison, export, and optional AI analysis |
+
 ## Features
 - **Concurrent Async Probing**: High-speed subdomain probing with Tokio and `reqwest`.
 - **Concurrency Rate Limiting**: Built-in `Semaphore` limit (`-c, --concurrency`) to prevent socket exhaustion.
-- **Scope Enforcement & Scheduler**: Strict `ScopePolicy` filter (`-s, --scope`) and fan-in hostname deduplication.
+- **Scope Enforcement & Scheduler**: `ScopePolicy` filter (`-s, --scope`), in-scope HTTP redirects, and fan-in hostname deduplication.
 - **Passive Recon (crt.sh)**: Automatic Certificate Transparency log querying (enabled by default with `--passive true`).
 - **TLS SAN Feedback Expansion**: Automatically extracts Subject Alternative Names (SANs) from TLS certs and queues in-scope targets dynamically.
 - **Web Tech Fingerprinting**: Technology detection with confidence scores and evidence tracing.
 - **Attack Surface Scan Diffing**: Historical diff engine (`--diff-last` or `--diff <SCAN_A> <SCAN_B>`) tracking new/removed subdomains, status code shifts, DNS IP changes, and new technologies.
-- **Local AI Analysis (Ollama Integration)**: Native AI threat & attack surface assessment using local LLMs (e.g. `llama3:8b` via `--llm-analyze`).
+- **Optional AI Analysis**: Attack surface assessment using local Ollama or Anthropic models via `--llm-analyze`.
 - **SQLite Storage**: Persistent local storage in SQLite (`recon_data.db`) in WAL mode with FK safety and thread-safe batch writing.
 - **Data Exporting**: Export scan results directly to JSON (`--export-json`), CSV (`--export-csv`), or diff JSON (`--export-diff-json`).
 
@@ -28,7 +38,7 @@ cargo build --release
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `-t, --target <TARGET>` | Single target domain or IP | None |
+| `-t, --target <TARGET>` | Single target domain or IP (required unless `--file` is used) | None |
 | `-s, --scope <SCOPE>...` | Authorized root scope domain(s) | Target input domain |
 | `-f, --file <PATH>` | File containing target subdomains (one per line) | None |
 | `-c, --concurrency <N>` | Maximum concurrent scan tasks | `20` |
@@ -39,6 +49,10 @@ cargo build --release
 | `--llm-analyze` | Enable local AI attack surface analysis via Ollama | `false` |
 | `--ollama-model <MODEL>` | Local Ollama model name | `llama3:8b` |
 | `--ollama-url <URL>` | Local Ollama API endpoint | `http://localhost:11434` |
+| `--llm-backend <BACKEND>` | AI backend (`ollama` or `anthropic`) | `ollama` |
+| `--anthropic-api-key <KEY>` | Anthropic API key (or use `ANTHROPIC_API_KEY`) | None |
+| `--anthropic-model <MODEL>` | Anthropic model name | `claude-3-5-haiku-20241022` |
+| `--llm-max-tokens <N>` | Maximum AI response tokens | `1024` |
 | `--export-json <PATH>` | Export scan observations to JSON file | None |
 | `--export-csv <PATH>` | Export scan observations to CSV file | None |
 | `--export-diff-json <PATH>` | Export scan diff results to JSON file | None |
@@ -53,6 +67,8 @@ cargo run -- -t example.com --scope example.com --passive true
 ```bash
 cargo run -- -t example.com --scope example.com --llm-analyze
 ```
+
+For Anthropic analysis, set `ANTHROPIC_API_KEY` and add `--llm-backend anthropic`.
 
 ### Rescan, auto-diff against previous run, and generate AI diff analysis:
 ```bash

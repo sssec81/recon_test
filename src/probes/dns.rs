@@ -1,7 +1,7 @@
-use crate::models::DnsRecord;
+use crate::storage::models::DnsRecord;
+use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::TokioAsyncResolver;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -12,10 +12,8 @@ pub struct AsyncDnsResolver {
 
 impl AsyncDnsResolver {
     pub fn new() -> Self {
-        let resolver = TokioAsyncResolver::tokio(
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-        );
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Self {
             resolver: Arc::new(resolver),
         }
@@ -83,17 +81,17 @@ impl AsyncDnsResolver {
         // Fallback to tokio lookup if hickory returned no A/AAAA records
         if records.is_empty() {
             let addr_str = format!("{}:80", hostname);
-            if let Ok(mut addrs) = tokio::net::lookup_host(&addr_str).await {
-                if let Some(addr) = addrs.next() {
-                    let rec_type = if addr.ip().is_ipv6() { "AAAA" } else { "A" };
-                    records.push(DnsRecord::new(
-                        scan_id,
-                        hostname.to_string(),
-                        rec_type.to_string(),
-                        addr.ip().to_string(),
-                        None,
-                    ));
-                }
+            if let Ok(mut addrs) = tokio::net::lookup_host(&addr_str).await
+                && let Some(addr) = addrs.next()
+            {
+                let rec_type = if addr.ip().is_ipv6() { "AAAA" } else { "A" };
+                records.push(DnsRecord::new(
+                    scan_id,
+                    hostname.to_string(),
+                    rec_type.to_string(),
+                    addr.ip().to_string(),
+                    None,
+                ));
             }
         }
 
@@ -104,16 +102,16 @@ impl AsyncDnsResolver {
         let random_prefix = format!("_wildcard_{}", uuid::Uuid::new_v4().simple());
         let probe_target = format!("{}.{}", random_prefix, domain.trim_start_matches("www."));
 
-        if let Ok(lookup) = self.resolver.ipv4_lookup(&probe_target).await {
-            if lookup.iter().next().is_some() {
-                return true;
-            }
+        if let Ok(lookup) = self.resolver.ipv4_lookup(&probe_target).await
+            && lookup.iter().next().is_some()
+        {
+            return true;
         }
 
-        if let Ok(lookup) = self.resolver.ipv6_lookup(&probe_target).await {
-            if lookup.iter().next().is_some() {
-                return true;
-            }
+        if let Ok(lookup) = self.resolver.ipv6_lookup(&probe_target).await
+            && lookup.iter().next().is_some()
+        {
+            return true;
         }
 
         false

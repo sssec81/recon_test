@@ -1,5 +1,5 @@
-use crate::models::HttpObservation;
-use rusqlite::{params, Connection};
+use crate::storage::models::HttpObservation;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -103,9 +103,8 @@ fn fetch_scan_tech_obs(
     conn: &Connection,
     scan_id: &Uuid,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT name FROM technology_observations WHERE scan_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT name FROM technology_observations WHERE scan_id = ?1")?;
 
     let scan_id_str = scan_id.to_string();
     let rows = stmt.query_map(params![scan_id_str], |row| {

@@ -1,7 +1,7 @@
-use crate::models::{
+use crate::storage::models::{
     DnsRecord, Hostname, HttpObservation, ScanRun, ServiceRecord, TechnologyObservation, TlsRecord,
 };
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -339,17 +339,17 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
 
 pub fn start_db_writer(
     db_path: String,
-) -> (
-    mpsc::Sender<ObservationBundle>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (mpsc::Sender<ObservationBundle>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<ObservationBundle>(1000);
 
     let handle = tokio::task::spawn_blocking(move || {
         let mut conn = match init_db(&db_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("❌ Failed to initialize SQLite database at '{}': {}", db_path, e);
+                eprintln!(
+                    "❌ Failed to initialize SQLite database at '{}': {}",
+                    db_path, e
+                );
                 return;
             }
         };
@@ -367,10 +367,10 @@ pub fn start_db_writer(
             }
         }
 
-        if !batch.is_empty() {
-            if let Err(e) = insert_bundle_batch(&mut conn, &batch) {
-                eprintln!("❌ Error flushing final SQLite observation batch: {}", e);
-            }
+        if !batch.is_empty()
+            && let Err(e) = insert_bundle_batch(&mut conn, &batch)
+        {
+            eprintln!("❌ Error flushing final SQLite observation batch: {}", e);
         }
     });
 
@@ -418,7 +418,7 @@ pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<Ht
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DiscoverySource, Hostname, HttpObservation};
+    use crate::storage::models::{DiscoverySource, Hostname, HttpObservation};
 
     #[test]
     fn test_rescan_foreign_key_safety() {
@@ -431,12 +431,8 @@ mod tests {
             scan_run.id,
             "sub.example.com".to_string(),
             "https://sub.example.com".to_string(),
-            Some(200),
-            Some("Test".to_string()),
-            None,
-            Some(50),
-            None,
-        );
+        )
+        .with_response(Some(200), Some("Test".to_string()), None, Some(50), None);
 
         let bundle1 = ObservationBundle {
             hostname: host.clone(),
@@ -460,6 +456,7 @@ mod tests {
             http_observation: http_obs,
         };
 
-        insert_bundle_batch(&mut conn, &[bundle2]).expect("Rescan batch insert failed due to foreign key failure!");
+        insert_bundle_batch(&mut conn, &[bundle2])
+            .expect("Rescan batch insert failed due to foreign key failure!");
     }
 }

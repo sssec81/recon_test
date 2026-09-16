@@ -8,10 +8,10 @@ pub const DEFAULT_PORTS: &[u16] = &[80, 443, 8000, 8080, 8443];
 pub async fn probe_port(host: &str, port: u16) -> bool {
     let addr = format!("{}:{}", host, port);
     let connect_fut = TcpStream::connect(&addr);
-    match timeout(Duration::from_secs(2), connect_fut).await {
-        Ok(Ok(_stream)) => true,
-        _ => false,
-    }
+    matches!(
+        timeout(Duration::from_secs(2), connect_fut).await,
+        Ok(Ok(_stream))
+    )
 }
 
 pub async fn probe_open_ports(host: &str, ports: &[u16]) -> Vec<u16> {

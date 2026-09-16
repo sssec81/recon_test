@@ -111,7 +111,9 @@ pub async fn probe_subdomain(
                 return res;
             }
             let http_url = format!("http://{}", subdomain);
-            probe_single_url(client, &http_url).await.unwrap_or_default()
+            probe_single_url(client, &http_url)
+                .await
+                .unwrap_or_default()
         }
         SchemeStrategy::BothParallel => {
             let https_url = format!("https://{}", subdomain);
@@ -147,7 +149,10 @@ mod tests {
         assert_eq!(extract_title(html), Some("Example Title".to_string()));
 
         let html_multiline = "<html><head><title>\n  Multi \n Line \n</title></head></html>";
-        assert_eq!(extract_title(html_multiline), Some("Multi   Line".to_string()));
+        assert_eq!(
+            extract_title(html_multiline),
+            Some("Multi   Line".to_string())
+        );
 
         let no_title = "<html><body>No Title</body></html>";
         assert_eq!(extract_title(no_title), None);

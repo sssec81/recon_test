@@ -1,8 +1,8 @@
-use crate::models::{
+use crate::scan::normalize::NormalizedHostname;
+use crate::scan::scope::ScopePolicy;
+use crate::storage::models::{
     DiscoverySource, DnsRecord, HttpObservation, ServiceRecord, TechnologyObservation, TlsRecord,
 };
-use crate::normalize::NormalizedHostname;
-use crate::scope::ScopePolicy;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -56,7 +56,11 @@ impl Scheduler {
         }
     }
 
-    pub async fn submit_target_with_source(&self, raw_target: &str, source: DiscoverySource) -> bool {
+    pub async fn submit_target_with_source(
+        &self,
+        raw_target: &str,
+        source: DiscoverySource,
+    ) -> bool {
         let norm = match NormalizedHostname::new(raw_target) {
             Some(n) => n,
             None => return false,

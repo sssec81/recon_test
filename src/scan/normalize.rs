@@ -53,7 +53,11 @@ pub struct NormalizedUrl(pub String);
 impl NormalizedUrl {
     pub fn new(hostname: &NormalizedHostname, scheme: &str) -> Self {
         let s = scheme.to_lowercase();
-        let clean_scheme = if s.starts_with("http") { s } else { "https".to_string() };
+        let clean_scheme = if s.starts_with("http") {
+            s
+        } else {
+            "https".to_string()
+        };
         Self(format!("{}://{}", clean_scheme, hostname.as_str()))
     }
 

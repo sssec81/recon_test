@@ -1,4 +1,4 @@
-use crate::normalize::NormalizedHostname;
+use crate::scan::normalize::NormalizedHostname;
 
 #[derive(Debug, Clone)]
 pub struct ScopePolicy {
@@ -15,10 +15,6 @@ impl ScopePolicy {
     }
 
     pub fn is_in_scope(&self, candidate: &NormalizedHostname) -> bool {
-        if self.allowed_roots.is_empty() {
-            return true;
-        }
-
         let cand_str = candidate.as_str();
         for root in &self.allowed_roots {
             let root_str = root.as_str();
@@ -28,6 +24,12 @@ impl ScopePolicy {
         }
 
         false
+    }
+
+    pub fn allows_redirect_url(&self, url: &reqwest::Url) -> bool {
+        url.host_str()
+            .and_then(NormalizedHostname::new)
+            .is_some_and(|host| self.is_in_scope(&host))
     }
 }
 
@@ -45,5 +47,16 @@ mod tests {
         assert!(policy.is_in_scope(&in_scope));
         assert!(policy.is_in_scope(&root_exact));
         assert!(!policy.is_in_scope(&out_scope));
+
+        let empty_policy = ScopePolicy::new(vec![" ".to_string()]);
+        assert!(!empty_policy.is_in_scope(&in_scope));
+    }
+
+    #[test]
+    fn test_redirect_scope() {
+        let policy = ScopePolicy::new(vec!["example.com".to_string()]);
+        assert!(policy.allows_redirect_url(&"https://app.example.com/login".parse().unwrap()));
+        assert!(!policy.allows_redirect_url(&"https://other.example.org/".parse().unwrap()));
+        assert!(!policy.allows_redirect_url(&"https://example.com.evil.org/".parse().unwrap()));
     }
 }

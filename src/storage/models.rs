@@ -203,27 +203,34 @@ pub struct HttpObservation {
 }
 
 impl HttpObservation {
-    pub fn new(
-        scan_id: Uuid,
-        hostname: String,
-        url: String,
+    pub fn new(scan_id: Uuid, hostname: String, url: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            scan_id,
+            hostname,
+            url,
+            status_code: None,
+            title: None,
+            server_header: None,
+            rtt_ms: None,
+            content_length: None,
+            observed_at: Utc::now(),
+        }
+    }
+
+    pub fn with_response(
+        mut self,
         status_code: Option<u16>,
         title: Option<String>,
         server_header: Option<String>,
         rtt_ms: Option<u64>,
         content_length: Option<usize>,
     ) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            scan_id,
-            hostname,
-            url,
-            status_code,
-            title,
-            server_header,
-            rtt_ms,
-            content_length,
-            observed_at: Utc::now(),
-        }
+        self.status_code = status_code;
+        self.title = title;
+        self.server_header = server_header;
+        self.rtt_ms = rtt_ms;
+        self.content_length = content_length;
+        self
     }
 }

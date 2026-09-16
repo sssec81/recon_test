@@ -40,15 +40,15 @@ pub fn fetch_tls_info(hostname: &str, port: u16) -> Option<TlsCertificateInfo> {
 
     // Iterate over X.509 extensions to find Subject Alternative Name (SAN)
     for ext in parsed_cert.extensions() {
-        if ext.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME {
-            if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
-                for name in &san.general_names {
-                    if let GeneralName::DNSName(dns) = name {
-                        let clean = dns.trim().to_lowercase();
-                        let clean_no_wild = clean.trim_start_matches("*.").to_string();
-                        if !clean_no_wild.is_empty() {
-                            san_domains.push(clean_no_wild);
-                        }
+        if ext.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME
+            && let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension()
+        {
+            for name in &san.general_names {
+                if let GeneralName::DNSName(dns) = name {
+                    let clean = dns.trim().to_lowercase();
+                    let clean_no_wild = clean.trim_start_matches("*.").to_string();
+                    if !clean_no_wild.is_empty() {
+                        san_domains.push(clean_no_wild);
                     }
                 }
             }
