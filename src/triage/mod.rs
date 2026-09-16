@@ -1,5 +1,6 @@
 mod crawl;
 mod detect;
+mod inventory;
 mod model;
 mod report;
 
@@ -8,6 +9,7 @@ use crate::scan::scope::ScopePolicy;
 use crate::storage::models::HttpObservation;
 pub(crate) use crawl::is_safe_url;
 use crawl::{FetchBudget, extract_links};
+use inventory::Inventory;
 use model::{Confidence, Finding, ReviewQueue};
 use reqwest::{Client, Url};
 use std::collections::{HashSet, VecDeque};
@@ -69,6 +71,7 @@ pub async fn run(
     let mut pages_crawled = 0;
     let mut candidates: Vec<Finding> = Vec::new();
     let mut seen_candidates = HashSet::new();
+    let mut inventory = Inventory::default();
     let crawl_request_limit = config.max_requests.saturating_mul(3).div_ceil(4);
     while let Some((url, depth)) = queue.pop_front() {
         if pages_crawled >= config.max_pages
@@ -88,6 +91,7 @@ pub async fn run(
             .as_deref()
             .and_then(|value| Url::parse(value).ok())
             .unwrap_or_else(|| url.clone());
+        inventory.record_page(&response_url, &page, scope);
         for finding in detect::detect(&page, &response_url) {
             if seen_candidates.insert(finding.id.clone())
                 && candidates.len() < config.max_findings.saturating_mul(20).max(50)
@@ -128,6 +132,17 @@ pub async fn run(
         }
         detect::verify(finding, &mut budget).await;
     }
+    let anomalies = inventory.anomalies();
+    for anomaly in &anomalies {
+        if budget.exhausted() {
+            break;
+        }
+        if let Some(finding) = detect::verify_response_anomaly(anomaly, &mut budget).await
+            && seen_candidates.insert(finding.id.clone())
+        {
+            candidates.push(finding);
+        }
+    }
     let candidates_found = seen_candidates.len();
     candidates.retain(|finding| finding.confidence >= Confidence::Candidate);
     candidates.sort_by(|a, b| {
@@ -144,8 +159,15 @@ pub async fn run(
         candidates_found,
         findings_suppressed: candidates_found.saturating_sub(candidates.len()),
         findings: candidates,
+        endpoints_discovered: inventory.endpoints().len(),
+        response_anomalies: anomalies.len(),
     };
-    let path = report::write_review(&mut review, &config.output_dir)?;
+    let path = report::write_review(
+        &mut review,
+        &config.output_dir,
+        &inventory.endpoints(),
+        &anomalies,
+    )?;
     println!(
         "📋 Triage review queue: {} finding(s), {} suppressed; saved to '{}'",
         review.findings.len(),
@@ -181,9 +203,20 @@ mod tests {
                         "/" => (
                             "200 OK",
                             "text/html",
-                            "<a href=\"/files/\">files</a><a href=\"/go-user\">user</a>",
+                            "<a href=\"/files/\">files</a><a href=\"/go-user\">user</a><a href=\"/api/items?id=1\">item</a><script src=\"/app.js\"></script><form method=\"post\" action=\"/api/search\"><input name=\"query\"></form>",
                         ),
                         "/go-user" => ("302 Found", "text/plain", ""),
+                        "/app.js" => (
+                            "200 OK",
+                            "application/javascript",
+                            "fetch('/api/items?id=2'); axios.post('/api/search', {query: 'x'});",
+                        ),
+                        "/api/items?id=1" => ("200 OK", "application/json", "{\"item\":1}"),
+                        "/api/items?id=2" => (
+                            "500 Internal Server Error",
+                            "application/json",
+                            "{\"error\":true}",
+                        ),
                         "/files/" => (
                             "200 OK",
                             "text/html",
@@ -219,7 +252,7 @@ mod tests {
         let output_dir = std::env::temp_dir().join(format!("recon_triage_test_{}", scan_id));
         let config = TriageConfig {
             max_pages: 10,
-            max_depth: 1,
+            max_depth: 2,
             max_requests: 20,
             max_minutes: 1,
             max_findings: 5,
@@ -239,9 +272,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(review.pages_crawled, 3);
-        assert_eq!(review.findings.len(), 2);
-        assert_eq!(review.requests_sent, 7);
+        assert_eq!(review.pages_crawled, 6);
+        assert_eq!(review.findings.len(), 4);
+        assert_eq!(review.requests_sent, 14);
+        assert_eq!(review.response_anomalies, 1);
         assert!(
             review
                 .findings
@@ -258,6 +292,14 @@ mod tests {
                     && finding.confidence == Confidence::Candidate)
         );
         assert!(
+            review
+                .findings
+                .iter()
+                .any(|finding| finding.category == "response_anomaly"
+                    && finding.repeats.len() == 2
+                    && finding.control.is_some())
+        );
+        assert!(
             output_dir
                 .join(scan_id.to_string())
                 .join("review.json")
@@ -267,6 +309,18 @@ mod tests {
             output_dir
                 .join(scan_id.to_string())
                 .join("evidence/finding-001/control.json")
+                .exists()
+        );
+        let endpoints =
+            std::fs::read_to_string(output_dir.join(scan_id.to_string()).join("endpoints.json"))
+                .unwrap();
+        assert!(endpoints.contains("\"method\": \"POST\""));
+        assert!(endpoints.contains("\"query\""));
+        assert!(endpoints.contains("javascript_call"));
+        assert!(
+            output_dir
+                .join(scan_id.to_string())
+                .join("anomalies.json")
                 .exists()
         );
         std::fs::remove_dir_all(output_dir).unwrap();

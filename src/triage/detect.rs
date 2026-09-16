@@ -1,5 +1,5 @@
 use crate::triage::crawl::FetchBudget;
-use crate::triage::model::{Confidence, Finding, Page};
+use crate::triage::model::{Confidence, Finding, Page, ResponseAnomaly};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -156,6 +156,52 @@ pub async fn verify(finding: &mut Finding, budget: &mut FetchBudget<'_>) {
             Confidence::StrongCandidate
         };
     }
+}
+
+pub async fn verify_response_anomaly(
+    anomaly: &ResponseAnomaly,
+    budget: &mut FetchBudget<'_>,
+) -> Option<Finding> {
+    let failure_url = Url::parse(&anomaly.baseline_url).ok()?;
+    let control_url = Url::parse(&anomaly.control_url).ok()?;
+    let baseline = budget.fetch(&failure_url).await?;
+    if baseline.evidence.status.is_none_or(|status| status < 500) {
+        return None;
+    }
+    let mut finding = base_finding(
+        "response_anomaly",
+        &format!(
+            "response_anomaly|{}|{}",
+            anomaly.url_template, anomaly.parameter
+        ),
+        "Repeatable server error for one parameter variant",
+        failure_url.as_str(),
+        &baseline,
+        &format!(
+            "The same route and parameter set returned HTTP {} for one observed value and HTTP {} for another. Two repeat requests and a control request kept that distinction.",
+            anomaly.baseline_status, anomaly.control_status
+        ),
+        "Inspect the error and compare the two authorized input values. Determine whether this exposes sensitive details or impacts a real user workflow before reporting.",
+        "Different values can validly produce different responses. A stable server error alone does not establish a security vulnerability.",
+        Confidence::Candidate,
+    );
+    for _ in 0..2 {
+        let repeat = budget.fetch(&failure_url).await?;
+        if repeat.evidence.status.is_none_or(|status| status < 500) {
+            return None;
+        }
+        finding.repeats.push(repeat.evidence);
+    }
+    let control = budget.fetch(&control_url).await?;
+    if !control
+        .evidence
+        .status
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return None;
+    }
+    finding.control = Some(control.evidence);
+    Some(finding)
 }
 
 fn signal_matches(category: &str, page: &Page) -> bool {

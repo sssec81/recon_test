@@ -1,10 +1,12 @@
-use crate::triage::model::{Finding, ReviewQueue};
+use crate::triage::model::{EndpointRecord, Finding, ResponseAnomaly, ReviewQueue};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn write_review(
     queue: &mut ReviewQueue,
     output_root: &Path,
+    endpoints: &[EndpointRecord],
+    anomalies: &[ResponseAnomaly],
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let run_dir = output_root.join(queue.scan_id.to_string());
     fs::create_dir_all(&run_dir)?;
@@ -27,6 +29,8 @@ pub fn write_review(
         write_json(&evidence_dir.join("metadata.json"), finding)?;
     }
     write_json(&run_dir.join("review.json"), queue)?;
+    write_json(&run_dir.join("endpoints.json"), &endpoints)?;
+    write_json(&run_dir.join("anomalies.json"), &anomalies)?;
     fs::write(run_dir.join("review.md"), render_markdown(queue))?;
     Ok(run_dir)
 }
@@ -41,10 +45,12 @@ fn write_json(
 
 fn render_markdown(queue: &ReviewQueue) -> String {
     let mut output = format!(
-        "# Recon review queue\n\nScan: `{}`\n\nPages crawled: {} · Requests: {} · Candidates: {} · Suppressed: {} · Budget exhausted: {}\n\n",
+        "# Recon review queue\n\nScan: `{}`\n\nPages crawled: {} · Requests: {} · Endpoints: {} · Response anomalies: {} · Candidates: {} · Suppressed: {} · Budget exhausted: {}\n\n",
         queue.scan_id,
         queue.pages_crawled,
         queue.requests_sent,
+        queue.endpoints_discovered,
+        queue.response_anomalies,
         queue.candidates_found,
         queue.findings_suppressed,
         queue.budget_exhausted,
@@ -91,6 +97,8 @@ mod tests {
             candidates_found: 0,
             findings_suppressed: 0,
             findings: vec![],
+            endpoints_discovered: 0,
+            response_anomalies: 0,
         };
         assert!(render_markdown(&queue).contains("No evidence-backed candidates"));
     }

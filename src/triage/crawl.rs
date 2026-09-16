@@ -5,6 +5,7 @@ use regex::Regex;
 use reqwest::{Client, Url};
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,10 @@ const EXCERPT_CHARS: usize = 1024;
 static API_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"["'](/(?:api|v[0-9]+)/[^"'\s<>]{1,180})["']"#)
         .expect("constant API path regex must compile")
+});
+static JS_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*["']([^"']{1,180})["']\s*(\)|,)"#)
+        .expect("constant JavaScript call regex must compile")
 });
 
 pub struct FetchBudget<'a> {
@@ -242,17 +247,24 @@ pub fn extract_links(page: &Page, base: &Url, scope: &ScopePolicy) -> Vec<Url> {
             }
         }
     }
-    if is_html(&page.evidence.content_type)
-        || page
-            .evidence
-            .content_type
-            .as_deref()
-            .is_some_and(|t| t.contains("javascript"))
-    {
-        for captures in API_PATH.captures_iter(&page.body) {
+    if let Some(script_text) = script_text(page) {
+        let calls = extract_js_calls(&script_text, base, scope);
+        let non_get: HashSet<String> = calls
+            .iter()
+            .filter(|(_, method)| method != "GET")
+            .map(|(url, _)| url.to_string())
+            .collect();
+        links.extend(
+            calls
+                .into_iter()
+                .filter(|(_, method)| method == "GET")
+                .map(|(url, _)| url),
+        );
+        for captures in API_PATH.captures_iter(&script_text) {
             if let Some(path) = captures.get(1)
                 && let Ok(url) = base.join(path.as_str())
                 && is_safe_url(&url, scope)
+                && !non_get.contains(url.as_str())
             {
                 links.push(url);
             }
@@ -260,7 +272,55 @@ pub fn extract_links(page: &Page, base: &Url, scope: &ScopePolicy) -> Vec<Url> {
     }
     links.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     links.dedup();
+    links.truncate(200);
     links
+}
+
+pub fn script_text(page: &Page) -> Option<String> {
+    if is_html(&page.evidence.content_type) {
+        let document = Html::parse_document(&page.body);
+        Selector::parse("script").ok().map(|selector| {
+            document
+                .select(&selector)
+                .flat_map(|node| node.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    } else if page
+        .evidence
+        .content_type
+        .as_deref()
+        .is_some_and(|t| t.contains("javascript"))
+    {
+        Some(page.body.clone())
+    } else {
+        None
+    }
+}
+
+pub fn extract_js_calls(script: &str, base: &Url, scope: &ScopePolicy) -> Vec<(Url, String)> {
+    JS_CALL
+        .captures_iter(script)
+        .filter_map(|captures| {
+            let call = captures.get(1)?.as_str().to_ascii_lowercase();
+            let path = captures.get(2)?.as_str();
+            let suffix = captures.get(3)?.as_str();
+            let method = if call == "fetch" {
+                if suffix == ")" { "GET" } else { "UNKNOWN" }
+            } else {
+                match call.as_str() {
+                    "axios.get" => "GET",
+                    "axios.post" => "POST",
+                    "axios.put" => "PUT",
+                    "axios.patch" => "PATCH",
+                    "axios.delete" => "DELETE",
+                    _ => "UNKNOWN",
+                }
+            };
+            let url = base.join(path).ok()?;
+            is_safe_url(&url, scope).then_some((url, method.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -279,5 +339,36 @@ mod tests {
         let links = extract_links(&page, &base, &scope);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].as_str(), "https://example.com/api/user?id=42");
+    }
+
+    #[test]
+    fn js_post_endpoint_is_recordable_but_not_crawled_as_get() {
+        let scope = ScopePolicy::new(vec!["example.com".into()]);
+        let base = Url::parse("https://example.com/app.js").unwrap();
+        let body = "axios.post('/api/order', {id: 1}); fetch('/api/items?id=2');";
+        let page = Page {
+            evidence: HttpEvidence {
+                requested_url: base.to_string(),
+                final_url: None,
+                status: Some(200),
+                content_type: Some("application/javascript".into()),
+                bytes: body.len(),
+                body_sha256: None,
+                title: None,
+                body_excerpt: None,
+                elapsed_ms: 0,
+                error: None,
+            },
+            body: body.into(),
+        };
+        let links = extract_links(&page, &base, &scope);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].path(), "/api/items");
+        let calls = extract_js_calls(body, &base, &scope);
+        assert!(
+            calls
+                .iter()
+                .any(|(url, method)| url.path() == "/api/order" && method == "POST")
+        );
     }
 }

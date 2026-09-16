@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -58,4 +59,28 @@ pub struct ReviewQueue {
     pub candidates_found: usize,
     pub findings_suppressed: usize,
     pub findings: Vec<Finding>,
+    pub endpoints_discovered: usize,
+    pub response_anomalies: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointRecord {
+    pub method: String,
+    pub url_template: String,
+    pub parameters: BTreeSet<String>,
+    pub sources: BTreeSet<String>,
+    pub status_codes: BTreeSet<u16>,
+    pub content_types: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseAnomaly {
+    pub url_template: String,
+    pub parameter: String,
+    pub baseline_url: String,
+    pub control_url: String,
+    pub baseline_status: u16,
+    pub control_status: u16,
+    pub baseline_content_type: Option<String>,
+    pub control_content_type: Option<String>,
 }
