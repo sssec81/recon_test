@@ -8,6 +8,7 @@ use crate::scan::scope::ScopePolicy;
 use crate::scan::worker;
 use crate::storage::db;
 use crate::storage::models::{DiscoverySource, ScanRun};
+use crate::triage::{self, TriageConfig};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -228,6 +229,27 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     db::finish_scan_run(&conn, &scan_run.id)?;
 
     println!("🎉 ScanRun {} completed successfully!", scan_run.id);
+
+    if args.triage {
+        let observations = db::get_scan_observations(&conn, &scan_run.id)?;
+        let scope = ScopePolicy::new(root_scope);
+        let triage_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(10)
+            .user_agent("recon_test/1.0.0")
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        triage::run(
+            &triage_client,
+            &scope,
+            &observations,
+            TriageConfig::from(&args),
+            scan_run.id,
+        )
+        .await?;
+    }
 
     reporting::report(args, &conn, &scan_run, &http_client).await
 }

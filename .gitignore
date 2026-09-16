@@ -4,3 +4,4 @@
 *.db-wal
 *.json
 *.csv
+/triage_output/

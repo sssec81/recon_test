@@ -140,7 +140,12 @@ pub async fn report(
     }
 
     // Generate optional AI summaries.
-    if args.llm_analyze {
+    if args.llm_analyze && args.triage {
+        println!(
+            "ℹ️  Triage mode kept AI off raw scan metadata; candidate-only AI analysis is planned for a later phase."
+        );
+    }
+    if args.llm_analyze && !args.triage {
         let provider = match args.llm_backend {
             LlmBackend::Ollama => llm::LlmProvider::Ollama {
                 url: args.ollama_url.clone(),

@@ -71,6 +71,38 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub llm_max_tokens: u32,
 
+    /// Run bounded crawl and evidence-backed candidate triage after recon
+    #[arg(long, default_value_t = false)]
+    pub triage: bool,
+
+    /// Maximum pages/assets to crawl during triage
+    #[arg(long, default_value_t = 250, value_parser = parse_positive_usize)]
+    pub triage_max_pages: usize,
+
+    /// Maximum link depth from discovered web endpoints
+    #[arg(long, default_value_t = 2)]
+    pub triage_max_depth: usize,
+
+    /// Maximum HTTP requests including verification requests
+    #[arg(long, default_value_t = 1000, value_parser = parse_positive_usize)]
+    pub triage_max_requests: usize,
+
+    /// Time limit for the triage phase in minutes
+    #[arg(long, default_value_t = 240, value_parser = parse_positive_u64)]
+    pub triage_max_minutes: u64,
+
+    /// Maximum candidates in the final review queue
+    #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
+    pub triage_max_findings: usize,
+
+    /// Delay between triage HTTP requests in milliseconds
+    #[arg(long, default_value_t = 200)]
+    pub triage_delay_ms: u64,
+
+    /// Directory for local triage evidence and review queues
+    #[arg(long, default_value = "triage_output")]
+    pub triage_dir: String,
+
     /// Export scan observations to JSON file
     #[arg(long)]
     pub export_json: Option<String>,
@@ -100,6 +132,17 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
         .map_err(|_| "expected a positive integer".to_string())?;
     if count == 0 {
         Err("concurrency must be at least 1".to_string())
+    } else {
+        Ok(count)
+    }
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let count = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if count == 0 {
+        Err("value must be at least 1".to_string())
     } else {
         Ok(count)
     }

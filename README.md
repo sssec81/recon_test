@@ -11,6 +11,7 @@ An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqw
 | `src/probes/` | Certificate, DNS, TCP, TLS, HTTP, and technology probes |
 | `src/storage/` | Observation models and SQLite persistence |
 | `src/report/` | Scan comparison, export, and optional AI analysis |
+| `src/triage/` | Bounded crawl, deterministic candidate checks, verification, and local review packages |
 
 ## Features
 - **Concurrent Async Probing**: High-speed subdomain probing with Tokio and `reqwest`.
@@ -23,6 +24,7 @@ An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqw
 - **Optional AI Analysis**: Attack surface assessment using local Ollama or Anthropic models via `--llm-analyze`.
 - **SQLite Storage**: Persistent local storage in SQLite (`recon_data.db`) in WAL mode with scan-specific service, TLS, and hostname discovery history.
 - **Data Exporting**: Export scan results directly to JSON (`--export-json`), CSV (`--export-csv`), or diff JSON (`--export-diff-json`).
+- **Optional Evidence Triage**: Crawl discovered in-scope web pages, identify a small set of review candidates, repeat safe checks, and save evidence locally with `--triage`.
 
 ## Installation & Build
 ```bash
@@ -53,6 +55,14 @@ cargo build --release
 | `--anthropic-api-key <KEY>` | Anthropic API key (or use `ANTHROPIC_API_KEY`) | None |
 | `--anthropic-model <MODEL>` | Anthropic model name | `claude-3-5-haiku-20241022` |
 | `--llm-max-tokens <N>` | Maximum AI response tokens | `1024` |
+| `--triage` | Run bounded evidence triage after recon | `false` |
+| `--triage-max-pages <N>` | Maximum pages or scripts fetched in triage | `250` |
+| `--triage-max-depth <N>` | Maximum crawl depth from discovered endpoints | `2` |
+| `--triage-max-requests <N>` | Total triage request budget, including checks | `1000` |
+| `--triage-max-minutes <N>` | Triage phase time limit in minutes | `240` |
+| `--triage-max-findings <N>` | Maximum review queue entries | `5` |
+| `--triage-delay-ms <N>` | Delay between triage requests | `200` |
+| `--triage-dir <PATH>` | Local review and evidence directory | `triage_output` |
 | `--export-json <PATH>` | Export scan observations to JSON file | None |
 | `--export-csv <PATH>` | Export scan observations to CSV file | None |
 | `--export-diff-json <PATH>` | Export scan diff results to JSON file | None |
@@ -69,6 +79,16 @@ cargo run -- -t example.com --scope example.com --llm-analyze
 ```
 
 For Anthropic analysis, set `ANTHROPIC_API_KEY` and add `--llm-backend anthropic`.
+
+### Build a local review queue
+
+```bash
+cargo run --release -- -t example.com --scope example.com --passive false --triage
+```
+
+Triage starts after recon. Its time and request limits apply to the triage phase only. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, and `evidence/`. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
+
+This first phase recognizes directory indexes, detailed server errors, and object identifiers in URLs. It repeats directory and server-error checks and sends a control request before raising confidence. An object identifier is only a **candidate for manual authorization testing**; it does not prove an access-control flaw. `Confirmed` is reserved for manual validation. `--llm-analyze` is skipped when `--triage` is enabled because candidate-only AI triage is planned for a later phase.
 
 ### Rescan, auto-diff against previous run, and generate AI diff analysis:
 ```bash

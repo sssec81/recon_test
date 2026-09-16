@@ -3,6 +3,7 @@ mod probes;
 mod report;
 mod scan;
 mod storage;
+mod triage;
 
 use clap::Parser;
 
