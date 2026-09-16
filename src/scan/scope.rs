@@ -18,7 +18,11 @@ impl ScopePolicy {
         let cand_str = candidate.as_str();
         for root in &self.allowed_roots {
             let root_str = root.as_str();
-            if cand_str == root_str || cand_str.ends_with(&format!(".{}", root_str)) {
+            if cand_str == root_str
+                || (!candidate.is_ip()
+                    && !root.is_ip()
+                    && cand_str.ends_with(&format!(".{}", root_str)))
+            {
                 return true;
             }
         }
@@ -27,9 +31,11 @@ impl ScopePolicy {
     }
 
     pub fn allows_redirect_url(&self, url: &reqwest::Url) -> bool {
-        url.host_str()
-            .and_then(NormalizedHostname::new)
-            .is_some_and(|host| self.is_in_scope(&host))
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .host_str()
+                .and_then(NormalizedHostname::new)
+                .is_some_and(|host| self.is_in_scope(&host))
     }
 }
 

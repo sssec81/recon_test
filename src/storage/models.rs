@@ -104,6 +104,7 @@ impl DnsRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRecord {
     pub id: String,
+    pub scan_id: Uuid,
     pub hostname: String,
     pub port: u16,
     pub protocol: String,
@@ -112,10 +113,17 @@ pub struct ServiceRecord {
 }
 
 impl ServiceRecord {
-    pub fn new(hostname: String, port: u16, protocol: String, is_open: bool) -> Self {
-        let id = format!("{}:{}:{}", hostname, port, protocol);
+    pub fn new(
+        scan_id: Uuid,
+        hostname: String,
+        port: u16,
+        protocol: String,
+        is_open: bool,
+    ) -> Self {
+        let id = format!("{}:{}:{}:{}", scan_id, hostname, port, protocol);
         Self {
             id,
+            scan_id,
             hostname,
             port,
             protocol,
@@ -128,6 +136,7 @@ impl ServiceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsRecord {
     pub id: String,
+    pub scan_id: Uuid,
     pub service_id: String,
     pub issuer: String,
     pub subject_ans: Vec<String>,
@@ -137,14 +146,16 @@ pub struct TlsRecord {
 
 impl TlsRecord {
     pub fn new(
+        scan_id: Uuid,
         service_id: String,
         issuer: String,
         subject_ans: Vec<String>,
         expires_at: Option<String>,
     ) -> Self {
-        let id = format!("{}:tls", service_id);
+        let id = format!("{}:{}:tls", scan_id, service_id);
         Self {
             id,
+            scan_id,
             service_id,
             issuer,
             subject_ans,

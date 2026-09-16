@@ -24,7 +24,7 @@ pub struct Args {
     pub file: Option<String>,
 
     /// Maximum concurrent scan tasks
-    #[arg(short, long, default_value_t = 20)]
+    #[arg(short, long, default_value_t = 20, value_parser = parse_positive_usize)]
     pub concurrency: usize,
 
     /// Enable passive Certificate Transparency reconnaissance
@@ -94,6 +94,17 @@ pub enum LlmBackend {
     Anthropic,
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if count == 0 {
+        Err("concurrency must be at least 1".to_string())
+    } else {
+        Ok(count)
+    }
+}
+
 pub fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -105,4 +116,13 @@ pub fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
         }
     }
     Ok(targets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_zero_concurrency() {
+        assert!(Args::try_parse_from(["recon_test", "-t", "example.com", "-c", "0"]).is_err());
+    }
 }

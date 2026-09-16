@@ -197,6 +197,11 @@ pub async fn analyze_scan_diff(
         "You are a cybersecurity intelligence analyst monitoring attack surface changes. Analyze this scan diff between Scan A ({}) and Scan B ({}):\n\n\
         - New Subdomains ({}): {:?}\n\
         - Removed Subdomains ({}): {:?}\n\
+        - New Endpoints ({}): {:?}\n\
+        - Removed Endpoints ({}): {:?}\n\
+        - New Services ({}): {:?}\n\
+        - Removed Services ({}): {:?}\n\
+        - Changed TLS Services ({}): {:?}\n\
         - Status Code Changes ({}): {:?}\n\
         - DNS IP Changes ({}): {:?}\n\
         - New Technologies Detected ({}): {:?}\n\n\
@@ -207,6 +212,16 @@ pub async fn analyze_scan_diff(
         diff.new_subdomains,
         diff.removed_subdomains.len(),
         diff.removed_subdomains,
+        diff.new_endpoints.len(),
+        diff.new_endpoints,
+        diff.removed_endpoints.len(),
+        diff.removed_endpoints,
+        diff.new_services.len(),
+        diff.new_services,
+        diff.removed_services.len(),
+        diff.removed_services,
+        diff.changed_tls.len(),
+        diff.changed_tls,
         diff.status_changes.len(),
         diff.status_changes,
         diff.ip_changes.len(),

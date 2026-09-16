@@ -8,72 +8,45 @@ struct CrtShEntry {
     name_value: String,
 }
 
-pub async fn query_crtsh(client: &Client, domain: &str) -> Vec<String> {
-    let clean_domain = domain
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("www.")
-        .trim_end_matches('/')
-        .to_lowercase();
-
-    if clean_domain.is_empty() {
-        return Vec::new();
-    }
-
-    let query_val = format!("%.{}", clean_domain);
-    let mut discovered = HashSet::new();
-    let max_attempts = 3;
-
-    for attempt in 1..=max_attempts {
-        let req_res = client
+pub async fn query_crtsh(client: &Client, domain: &str) -> Result<Vec<String>, String> {
+    let query_val = format!("%.{domain}");
+    let mut last_error = String::new();
+    for attempt in 1..=3 {
+        let result = client
             .get("https://crt.sh/")
             .query(&[("q", &query_val), ("output", &"json".to_string())])
-            .header("User-Agent", "recon_test/1.0.0")
             .timeout(Duration::from_secs(12))
             .send()
             .await;
-
-        match req_res {
+        match result {
             Ok(response) if response.status().is_success() => {
-                if let Ok(entries) = response.json::<Vec<CrtShEntry>>().await {
-                    for entry in entries {
-                        for line in entry.name_value.lines() {
-                            let mut name = line.trim().to_lowercase();
-                            if name.starts_with("*.") {
-                                name = name["*.".len()..].to_string();
-                            }
-                            if !name.is_empty() && name.contains(&clean_domain) {
-                                discovered.insert(name);
+                match response.json::<Vec<CrtShEntry>>().await {
+                    Ok(entries) => {
+                        let mut names = HashSet::new();
+                        for entry in entries {
+                            for line in entry.name_value.lines() {
+                                let name =
+                                    line.trim().trim_start_matches("*.").to_ascii_lowercase();
+                                if !name.is_empty() {
+                                    names.insert(name);
+                                }
                             }
                         }
+                        let mut names: Vec<String> = names.into_iter().collect();
+                        names.sort();
+                        return Ok(names);
                     }
-                    return discovered.into_iter().collect();
+                    Err(error) => last_error = format!("invalid crt.sh JSON: {error}"),
                 }
             }
-            Ok(res) => {
-                if attempt == max_attempts {
-                    eprintln!(
-                        "⚠️  [crt.sh] HTTP error {} querying subdomains for '{}' after {} attempts",
-                        res.status(),
-                        clean_domain,
-                        max_attempts
-                    );
-                }
-            }
-            Err(e) => {
-                if attempt == max_attempts {
-                    eprintln!(
-                        "⚠️  [crt.sh] Request failed for domain '{}': {} (after {} attempts)",
-                        clean_domain, e, max_attempts
-                    );
-                }
-            }
+            Ok(response) => last_error = format!("crt.sh HTTP {}", response.status()),
+            Err(error) => last_error = format!("crt.sh request failed: {error}"),
         }
-
-        if attempt < max_attempts {
-            tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
         }
     }
-
-    discovered.into_iter().collect()
+    Err(format!(
+        "crt.sh query for {domain} failed after 3 attempts: {last_error}"
+    ))
 }

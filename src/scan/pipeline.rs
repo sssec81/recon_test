@@ -38,17 +38,20 @@ pub enum ReconEvent {
         technologies: Vec<TechnologyObservation>,
     },
     HttpObserved(HttpObservation),
+    TargetFinished {
+        hostname: NormalizedHostname,
+    },
 }
 
 #[derive(Clone)]
 pub struct Scheduler {
     scope: ScopePolicy,
     seen_hostnames: Arc<Mutex<HashSet<NormalizedHostname>>>,
-    work_tx: mpsc::Sender<WorkItem>,
+    work_tx: mpsc::UnboundedSender<WorkItem>,
 }
 
 impl Scheduler {
-    pub fn new(scope: ScopePolicy, work_tx: mpsc::Sender<WorkItem>) -> Self {
+    pub fn new(scope: ScopePolicy, work_tx: mpsc::UnboundedSender<WorkItem>) -> Self {
         Self {
             scope,
             seen_hostnames: Arc::new(Mutex::new(HashSet::new())),
@@ -77,14 +80,12 @@ impl Scheduler {
             }
         }
 
-        let _ = self
-            .work_tx
+        self.work_tx
             .send(WorkItem::ProbeTarget {
                 hostname: norm,
                 source,
             })
-            .await;
-        true
+            .is_ok()
     }
 
     pub async fn submit_raw_target(&self, raw_target: &str) -> bool {

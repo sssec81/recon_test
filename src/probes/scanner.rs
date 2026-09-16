@@ -118,30 +118,27 @@ pub async fn probe_subdomain(
         SchemeStrategy::BothParallel => {
             let https_url = format!("https://{}", subdomain);
             let http_url = format!("http://{}", subdomain);
-
-            let c1 = client.clone();
-            let c2 = client.clone();
-
-            let https_fut = tokio::spawn(async move { probe_single_url(&c1, &https_url).await });
-            let http_fut = tokio::spawn(async move { probe_single_url(&c2, &http_url).await });
-
-            let (res_https, res_http) = tokio::join!(https_fut, http_fut);
-
-            if let Ok(Some(res)) = res_https {
-                return res;
-            }
-            if let Ok(Some(res)) = res_http {
-                return res;
-            }
-
-            ScanResult::default()
+            race_urls(client, &https_url, &http_url).await
         }
     }
+}
+
+async fn race_urls(client: &Client, first_url: &str, second_url: &str) -> ScanResult {
+    let first = probe_single_url(client, first_url);
+    let second = probe_single_url(client, second_url);
+    tokio::pin!(first, second);
+    tokio::select! {
+        result = &mut first => match result { Some(r) => Some(r), None => second.await },
+        result = &mut second => match result { Some(r) => Some(r), None => first.await },
+    }
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_extract_title() {
@@ -156,5 +153,35 @@ mod tests {
 
         let no_title = "<html><body>No Title</body></html>";
         assert_eq!(extract_title(no_title), None);
+    }
+
+    #[tokio::test]
+    async fn parallel_probe_returns_before_slow_endpoint() {
+        let fast = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_url = format!("http://{}", fast.local_addr().unwrap());
+        let slow_url = format!("http://{}", slow.local_addr().unwrap());
+        let fast_task = tokio::spawn(async move {
+            let (mut socket, _) = fast.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let slow_task = tokio::spawn(async move {
+            let (mut socket, _) = slow.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let client = Client::new();
+        let start = Instant::now();
+        let result = race_urls(&client, &slow_url, &fast_url).await;
+        assert_eq!(result.status_code, Some(200));
+        assert!(start.elapsed() < std::time::Duration::from_millis(400));
+        fast_task.await.unwrap();
+        slow_task.abort();
     }
 }

@@ -8,6 +8,8 @@ use crate::scan::scope::ScopePolicy;
 use crate::scan::worker;
 use crate::storage::db;
 use crate::storage::models::{DiscoverySource, ScanRun};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -44,18 +46,46 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         return Err("Provide --target or --file to start a scan".into());
     };
+    if raw_targets.is_empty() {
+        return Err("Target file did not contain any targets".into());
+    }
 
     // Build one policy for scheduling and HTTP redirects.
-    let root_scope = if !args.scope.is_empty() {
+    let raw_scope = if !args.scope.is_empty() {
         args.scope.clone()
     } else {
         raw_targets.clone()
     };
 
-    let scope_policy = ScopePolicy::new(root_scope.clone());
-    if scope_policy.allowed_roots.is_empty() {
+    let scope_policy = ScopePolicy::new(raw_scope.clone());
+    if scope_policy.allowed_roots.len() != raw_scope.len() || raw_scope.is_empty() {
         return Err("No valid scope domains were provided".into());
     }
+    let mut root_scope: Vec<String> = scope_policy
+        .allowed_roots
+        .iter()
+        .map(|root| root.as_str().to_string())
+        .collect();
+    root_scope.sort();
+    root_scope.dedup();
+    let mut seed_hosts: Vec<String> = raw_targets
+        .iter()
+        .map(|raw| {
+            crate::scan::normalize::NormalizedHostname::new(raw)
+                .map(|host| host.as_str().to_string())
+                .ok_or_else(|| format!("Invalid target: {raw}"))
+        })
+        .collect::<Result<_, _>>()?;
+    seed_hosts.sort();
+    seed_hosts.dedup();
+    let config = format!(
+        "v2;passive={};scheme={:?};ports={:?};seeds={:?}",
+        args.passive,
+        args.scheme_strategy,
+        crate::probes::services::DEFAULT_PORTS,
+        seed_hosts
+    );
+    let config_hash = format!("{:x}", Sha256::digest(config.as_bytes()));
 
     // Active HTTP redirects must stay within the same scope as the seed targets.
     let redirect_scope = scope_policy.clone();
@@ -80,23 +110,30 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (db_tx, db_writer_handle) = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
 
-    let (work_tx, mut work_rx) = mpsc::channel::<WorkItem>(10000);
+    let (work_tx, mut work_rx) = mpsc::unbounded_channel::<WorkItem>();
     let (event_tx, event_rx) = mpsc::channel::<ReconEvent>(10000);
 
     let scheduler = Scheduler::new(scope_policy, work_tx);
 
-    // Check wildcard DNS on root scope domains.
+    // Keep wildcard fingerprints for validating generated DNS candidates.
+    let mut wildcard_ips = HashMap::new();
     for root_domain in &root_scope {
-        if dns_resolver.is_wildcard_domain(root_domain).await {
+        if crate::scan::normalize::NormalizedHostname::new(root_domain).is_some_and(|h| h.is_ip()) {
+            continue;
+        }
+        let ips = dns_resolver.wildcard_ips(root_domain).await;
+        if !ips.is_empty() {
             println!(
                 "⚠️  Wildcard DNS catch-all detected for domain: '{}'",
                 root_domain
             );
+            wildcard_ips.insert(root_domain.clone(), ips);
         }
     }
+    let wildcard_ips = Arc::new(wildcard_ips);
 
     // Create the scan run.
-    let mut scan_run = ScanRun::new(root_scope.clone(), "v1.0.0".to_string());
+    let mut scan_run = ScanRun::new(root_scope.clone(), config_hash);
     db::save_scan_run(&conn, &scan_run)?;
     println!("🆔 Initialized ScanRun session: {}", scan_run.id);
 
@@ -111,8 +148,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Add passive Certificate Transparency discoveries.
     if args.passive {
         println!("📜 Ingesting passive Certificate Transparency logs (crt.sh)...");
-        for root_domain in &root_scope {
-            let ct_subdomains = crtsh::query_crtsh(&http_client, root_domain).await;
+        for root_domain in root_scope.iter().filter(|root| {
+            !crate::scan::normalize::NormalizedHostname::new(root).is_some_and(|h| h.is_ip())
+        }) {
+            let ct_subdomains = crtsh::query_crtsh(&http_client, root_domain).await?;
             println!(
                 "  [crt.sh] Discovered {} candidate subdomain(s) for domain '{}'",
                 ct_subdomains.len(),
@@ -154,19 +193,20 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(work) = work_rx.recv() => {
                 inflight += 1;
                 let sem = Arc::clone(&semaphore);
-                let client = probe_client.clone();
-                let resolver = dns_resolver.clone();
-                let strategy = args.scheme_strategy;
-                let scan_id = scan_run.id;
-                let bus = event_tx.clone();
-                let worker_scheduler = main_scheduler.clone();
+                let context = worker::WorkerContext {
+                    client: probe_client.clone(), resolver: dns_resolver.clone(),
+                    strategy: args.scheme_strategy, scan_id: scan_run.id,
+                    bus: event_tx.clone(), scheduler: main_scheduler.clone(),
+                    wildcard_ips: Arc::clone(&wildcard_ips),
+                };
 
                 set.spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    worker::probe(work, client, resolver, strategy, scan_id, bus, worker_scheduler).await;
+                    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+                    worker::probe(work, context).await
                 });
             }
-            Some(_) = set.join_next(), if inflight > 0 => {
+            Some(result) = set.join_next(), if inflight > 0 => {
+                result??;
                 inflight -= 1;
             }
             else => break,
@@ -177,11 +217,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Drop event_tx & work_tx to close processor cleanly
     drop(event_tx);
-    let _ = event_processor_handle.await;
+    event_processor_handle.await??;
 
     // Drop db_tx to flush remaining SQLite records and await writer completion
     drop(db_tx);
-    let _ = db_writer_handle.await;
+    db_writer_handle.await??;
 
     // Mark the run complete after all observation bundles are written.
     scan_run.complete();
@@ -189,5 +229,5 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🎉 ScanRun {} completed successfully!", scan_run.id);
 
-    reporting::report(args, &conn, scan_run.id, &http_client).await
+    reporting::report(args, &conn, &scan_run, &http_client).await
 }

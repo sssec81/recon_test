@@ -21,7 +21,12 @@ pub fn fetch_tls_info(hostname: &str, port: u16) -> Option<TlsCertificateInfo> {
         .build()
         .ok()?;
 
-    let addr_str = format!("{}:{}", hostname, port);
+    let host_for_socket = if hostname.contains(':') {
+        format!("[{hostname}]")
+    } else {
+        hostname.to_string()
+    };
+    let addr_str = format!("{}:{}", host_for_socket, port);
     let socket_addr = addr_str.to_socket_addrs().ok()?.next()?;
 
     let stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3)).ok()?;

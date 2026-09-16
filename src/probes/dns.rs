@@ -2,6 +2,7 @@ use crate::storage::models::DnsRecord;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::RecordType;
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -21,6 +22,16 @@ impl AsyncDnsResolver {
 
     pub async fn resolve_all(&self, scan_id: Uuid, hostname: &str) -> Vec<DnsRecord> {
         let mut records = Vec::new();
+        if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+            let kind = if ip.is_ipv4() { "A" } else { "AAAA" };
+            return vec![DnsRecord::new(
+                scan_id,
+                hostname.to_string(),
+                kind.to_string(),
+                ip.to_string(),
+                None,
+            )];
+        }
 
         // 1. Resolve A records (IPv4)
         if let Ok(lookup) = self.resolver.ipv4_lookup(hostname).await {
@@ -79,7 +90,10 @@ impl AsyncDnsResolver {
         }
 
         // Fallback to tokio lookup if hickory returned no A/AAAA records
-        if records.is_empty() {
+        if !records
+            .iter()
+            .any(|r| r.record_type == "A" || r.record_type == "AAAA")
+        {
             let addr_str = format!("{}:80", hostname);
             if let Ok(mut addrs) = tokio::net::lookup_host(&addr_str).await
                 && let Some(addr) = addrs.next()
@@ -98,22 +112,22 @@ impl AsyncDnsResolver {
         records
     }
 
-    pub async fn is_wildcard_domain(&self, domain: &str) -> bool {
-        let random_prefix = format!("_wildcard_{}", uuid::Uuid::new_v4().simple());
-        let probe_target = format!("{}.{}", random_prefix, domain.trim_start_matches("www."));
-
-        if let Ok(lookup) = self.resolver.ipv4_lookup(&probe_target).await
-            && lookup.iter().next().is_some()
-        {
-            return true;
+    pub async fn wildcard_ips(&self, domain: &str) -> HashSet<String> {
+        let mut samples = Vec::new();
+        for _ in 0..2 {
+            let probe = format!("wildcard-{}.{}", uuid::Uuid::new_v4().simple(), domain);
+            let records = self.resolve_all(Uuid::nil(), &probe).await;
+            let ips: HashSet<String> = records
+                .into_iter()
+                .filter(|r| r.record_type == "A" || r.record_type == "AAAA")
+                .map(|r| r.value)
+                .collect();
+            samples.push(ips);
         }
-
-        if let Ok(lookup) = self.resolver.ipv6_lookup(&probe_target).await
-            && lookup.iter().next().is_some()
-        {
-            return true;
+        if samples[0].is_empty() || samples[0] != samples[1] {
+            HashSet::new()
+        } else {
+            samples.remove(0)
         }
-
-        false
     }
 }

@@ -1,15 +1,17 @@
 use crate::cli::{Args, LlmBackend};
 use crate::report::{diff, exporter, llm};
 use crate::storage::db;
+use crate::storage::models::ScanRun;
 use rusqlite::Connection;
 use uuid::Uuid;
 
 pub async fn report(
     args: Args,
     conn: &Connection,
-    scan_id: Uuid,
+    scan_run: &ScanRun,
     http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let scan_id = scan_run.id;
     // Export observations when requested.
     if args.export_json.is_some() || args.export_csv.is_some() {
         let scan_observations = db::get_scan_observations(conn, &scan_id)?;
@@ -37,8 +39,8 @@ pub async fn report(
 
     // Compare this run with historical results when requested.
     let diff_run_ids = if args.diff_last {
-        if let Ok(Some((prev_run, curr_run))) = db::get_last_two_scan_runs(conn) {
-            Some((prev_run.id, curr_run.id))
+        if let Some(previous) = db::get_previous_compatible_scan(conn, scan_run)? {
+            Some((previous, scan_id))
         } else {
             println!("ℹ️  Not enough historical ScanRuns found to perform auto-diff.");
             None
@@ -78,13 +80,38 @@ pub async fn report(
                     diff_result.removed_subdomains
                 );
                 println!(
+                    "  [+] New Endpoints ({}): {:?}",
+                    diff_result.new_endpoints.len(),
+                    diff_result.new_endpoints
+                );
+                println!(
+                    "  [-] Removed Endpoints ({}): {:?}",
+                    diff_result.removed_endpoints.len(),
+                    diff_result.removed_endpoints
+                );
+                println!(
+                    "  [+] New Services ({}): {:?}",
+                    diff_result.new_services.len(),
+                    diff_result.new_services
+                );
+                println!(
+                    "  [-] Removed Services ({}): {:?}",
+                    diff_result.removed_services.len(),
+                    diff_result.removed_services
+                );
+                println!(
+                    "  [Δ] Changed TLS ({}): {:?}",
+                    diff_result.changed_tls.len(),
+                    diff_result.changed_tls
+                );
+                println!(
                     "  [Δ] Status Changes ({}):",
                     diff_result.status_changes.len()
                 );
                 for sc in &diff_result.status_changes {
                     println!(
                         "      - {:<24} : {:?} ➔ {:?}",
-                        sc.hostname, sc.old_status, sc.new_status
+                        sc.endpoint_url, sc.old_status, sc.new_status
                     );
                 }
                 println!("  [Δ] DNS IP Changes ({}):", diff_result.ip_changes.len());

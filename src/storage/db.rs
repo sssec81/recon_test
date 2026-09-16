@@ -54,11 +54,21 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    // Migration for existing v1.0.0 databases missing scan_id in dns_records
-    let _ = conn.execute(
-        "ALTER TABLE dns_records ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''",
-        [],
-    );
+    // Migration for existing v1.0.0 databases missing scan_id in dns_records.
+    let has_scan_id = {
+        let mut stmt = conn.prepare("PRAGMA table_info(dns_records)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "scan_id")
+    };
+    if !has_scan_id {
+        conn.execute(
+            "ALTER TABLE dns_records ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
 
     // 4. Services table
     conn.execute(
@@ -123,6 +133,31 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hostname_discoveries (
+            scan_id TEXT NOT NULL, hostname_id TEXT NOT NULL, source TEXT NOT NULL,
+            discovered_from TEXT, observed_at TEXT NOT NULL,
+            PRIMARY KEY(scan_id, hostname_id),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(hostname_id) REFERENCES hostnames(id)
+        );
+        CREATE TABLE IF NOT EXISTS service_observations (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, hostname TEXT NOT NULL,
+            port INTEGER NOT NULL, protocol TEXT NOT NULL, is_open BOOLEAN NOT NULL,
+            observed_at TEXT NOT NULL,
+            UNIQUE(scan_id, hostname, port, protocol),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(hostname) REFERENCES hostnames(name)
+        );
+        CREATE TABLE IF NOT EXISTS tls_observations (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, service_id TEXT NOT NULL,
+            issuer TEXT NOT NULL, subject_ans TEXT NOT NULL, expires_at TEXT,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(service_id) REFERENCES service_observations(id)
+        );",
+    )?;
+
     Ok(conn)
 }
 
@@ -152,54 +187,29 @@ pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
     Ok(())
 }
 
-pub fn get_last_two_scan_runs(conn: &Connection) -> Result<Option<(ScanRun, ScanRun)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, started_at, finished_at, root_scope, config_hash FROM scan_runs WHERE finished_at IS NOT NULL ORDER BY started_at DESC LIMIT 2",
-    )?;
-
-    let runs_iter = stmt.query_map([], |row| {
-        let id_str: String = row.get(0)?;
-        let start_str: String = row.get(1)?;
-        let finish_str: Option<String> = row.get(2)?;
-        let scope_json: String = row.get(3)?;
-        let hash: String = row.get(4)?;
-
-        let root_scope: Vec<String> = serde_json::from_str(&scope_json).unwrap_or_default();
-
-        Ok(ScanRun {
-            id: Uuid::parse_str(&id_str).unwrap_or_default(),
-            started_at: chrono::DateTime::parse_from_rfc3339(&start_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            finished_at: finish_str.and_then(|f| {
-                chrono::DateTime::parse_from_rfc3339(&f)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .ok()
-            }),
-            root_scope,
-            config_hash: hash,
-        })
-    })?;
-
-    let mut runs = Vec::new();
-    for r in runs_iter {
-        runs.push(r?);
-    }
-
-    if runs.len() == 2 {
-        Ok(Some((runs[1].clone(), runs[0].clone())))
-    } else {
-        Ok(None)
+pub fn get_previous_compatible_scan(conn: &Connection, current: &ScanRun) -> Result<Option<Uuid>> {
+    let scope = serde_json::to_string(&current.root_scope).unwrap_or_default();
+    let result = conn.query_row(
+        "SELECT id FROM scan_runs WHERE finished_at IS NOT NULL AND id != ?1
+         AND root_scope = ?2 AND config_hash = ?3 ORDER BY finished_at DESC LIMIT 1",
+        params![current.id.to_string(), scope, current.config_hash],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(id) => Ok(Uuid::parse_str(&id).ok()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
 pub struct ObservationBundle {
+    pub scan_id: Uuid,
     pub hostname: Hostname,
     pub dns_records: Vec<DnsRecord>,
     pub services: Vec<ServiceRecord>,
-    pub tls_record: Option<TlsRecord>,
+    pub tls_records: Vec<TlsRecord>,
     pub technologies: Vec<TechnologyObservation>,
-    pub http_observation: HttpObservation,
+    pub http_observations: Vec<HttpObservation>,
 }
 
 pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle]) -> Result<()> {
@@ -208,9 +218,12 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
         let mut stmt_host = tx.prepare(
             "INSERT INTO hostnames (id, name, source, discovered_from)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-               source = EXCLUDED.source,
-               discovered_from = COALESCE(EXCLUDED.discovered_from, hostnames.discovered_from)",
+             ON CONFLICT(id) DO NOTHING",
+        )?;
+
+        let mut stmt_discovery = tx.prepare(
+            "INSERT INTO hostname_discoveries (scan_id, hostname_id, source, discovered_from, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(scan_id, hostname_id) DO NOTHING",
         )?;
 
         let mut stmt_dns = tx.prepare(
@@ -220,19 +233,13 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
         )?;
 
         let mut stmt_svc = tx.prepare(
-            "INSERT INTO services (id, hostname, port, protocol, is_open, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET is_open = EXCLUDED.is_open, observed_at = EXCLUDED.observed_at",
+            "INSERT INTO service_observations (id, scan_id, hostname, port, protocol, is_open, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
 
         let mut stmt_tls = tx.prepare(
-            "INSERT INTO tls_certificates (id, service_id, issuer, subject_ans, expires_at, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-               issuer = EXCLUDED.issuer,
-               subject_ans = EXCLUDED.subject_ans,
-               expires_at = EXCLUDED.expires_at,
-               observed_at = EXCLUDED.observed_at",
+            "INSERT INTO tls_observations (id, scan_id, service_id, issuer, subject_ans, expires_at, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
 
         let mut stmt_tech = tx.prepare(
@@ -263,6 +270,13 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                 bundle.hostname.source.to_string(),
                 bundle.hostname.discovered_from,
             ])?;
+            stmt_discovery.execute(params![
+                bundle.scan_id.to_string(),
+                bundle.hostname.id,
+                bundle.hostname.source.to_string(),
+                bundle.hostname.discovered_from,
+                chrono::Utc::now().to_rfc3339(),
+            ])?;
 
             // Save DNS Records
             for dns in &bundle.dns_records {
@@ -281,6 +295,7 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
             for svc in &bundle.services {
                 stmt_svc.execute(params![
                     svc.id,
+                    svc.scan_id.to_string(),
                     svc.hostname,
                     svc.port as i32,
                     svc.protocol,
@@ -290,10 +305,11 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
             }
 
             // Save TLS Certificate
-            if let Some(ref tls) = bundle.tls_record {
+            for tls in &bundle.tls_records {
                 let ans_json = serde_json::to_string(&tls.subject_ans).unwrap_or_default();
                 stmt_tls.execute(params![
                     tls.id,
+                    tls.scan_id.to_string(),
                     tls.service_id,
                     tls.issuer,
                     ans_json,
@@ -318,19 +334,20 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
             }
 
             // Save HTTP Observation
-            let http = &bundle.http_observation;
-            stmt_http.execute(params![
-                http.id.to_string(),
-                http.scan_id.to_string(),
-                http.hostname,
-                http.url,
-                http.status_code.map(|s| s as i32),
-                http.title,
-                http.server_header,
-                http.rtt_ms.map(|r| r as i64),
-                http.content_length.map(|c| c as i64),
-                http.observed_at.to_rfc3339(),
-            ])?;
+            for http in &bundle.http_observations {
+                stmt_http.execute(params![
+                    http.id.to_string(),
+                    http.scan_id.to_string(),
+                    http.hostname,
+                    http.url,
+                    http.status_code.map(|s| s as i32),
+                    http.title,
+                    http.server_header,
+                    http.rtt_ms.map(|r| r as i64),
+                    http.content_length.map(|c| c as i64),
+                    http.observed_at.to_rfc3339(),
+                ])?;
+            }
         }
     }
     tx.commit()?;
@@ -339,20 +356,14 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
 
 pub fn start_db_writer(
     db_path: String,
-) -> (mpsc::Sender<ObservationBundle>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<ObservationBundle>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let (tx, mut rx) = mpsc::channel::<ObservationBundle>(1000);
 
-    let handle = tokio::task::spawn_blocking(move || {
-        let mut conn = match init_db(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "❌ Failed to initialize SQLite database at '{}': {}",
-                    db_path, e
-                );
-                return;
-            }
-        };
+    let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = init_db(&db_path)?;
 
         let mut batch = Vec::with_capacity(100);
 
@@ -360,18 +371,15 @@ pub fn start_db_writer(
             batch.push(bundle);
 
             if batch.len() >= 100 {
-                if let Err(e) = insert_bundle_batch(&mut conn, &batch) {
-                    eprintln!("❌ Error flushing SQLite observation batch: {}", e);
-                }
+                insert_bundle_batch(&mut conn, &batch)?;
                 batch.clear();
             }
         }
 
-        if !batch.is_empty()
-            && let Err(e) = insert_bundle_batch(&mut conn, &batch)
-        {
-            eprintln!("❌ Error flushing final SQLite observation batch: {}", e);
+        if !batch.is_empty() {
+            insert_bundle_batch(&mut conn, &batch)?;
         }
+        Ok(())
     });
 
     (tx, handle)
@@ -418,7 +426,9 @@ pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<Ht
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::models::{DiscoverySource, Hostname, HttpObservation};
+    use crate::storage::models::{
+        DiscoverySource, Hostname, HttpObservation, ServiceRecord, TlsRecord,
+    };
 
     #[test]
     fn test_rescan_foreign_key_safety() {
@@ -435,12 +445,13 @@ mod tests {
         .with_response(Some(200), Some("Test".to_string()), None, Some(50), None);
 
         let bundle1 = ObservationBundle {
+            scan_id: scan_run.id,
             hostname: host.clone(),
             dns_records: Vec::new(),
             services: Vec::new(),
-            tls_record: None,
+            tls_records: Vec::new(),
             technologies: Vec::new(),
-            http_observation: http_obs.clone(),
+            http_observations: vec![http_obs.clone()],
         };
 
         // First scan insert
@@ -448,15 +459,146 @@ mod tests {
 
         // Second scan insert (rescan of exact same host with foreign keys ON)
         let bundle2 = ObservationBundle {
+            scan_id: scan_run.id,
             hostname: host,
             dns_records: Vec::new(),
             services: Vec::new(),
-            tls_record: None,
+            tls_records: Vec::new(),
             technologies: Vec::new(),
-            http_observation: http_obs,
+            http_observations: vec![http_obs],
         };
 
         insert_bundle_batch(&mut conn, &[bundle2])
             .expect("Rescan batch insert failed due to foreign key failure!");
+    }
+
+    #[test]
+    fn preserves_scan_scoped_history() {
+        let mut conn = init_db(":memory:").unwrap();
+        let mut first = ScanRun::new(vec!["example.com".into()], "same-config".into());
+        let second = ScanRun::new(vec!["example.com".into()], "same-config".into());
+        save_scan_run(&conn, &first).unwrap();
+        save_scan_run(&conn, &second).unwrap();
+        let name = "api.example.com".to_string();
+        for (run, source) in [
+            (first.id, DiscoverySource::Seed),
+            (second.id, DiscoverySource::TlsSan),
+        ] {
+            let service = ServiceRecord::new(run, name.clone(), 443, "tcp".into(), true);
+            let tls = TlsRecord::new(
+                run,
+                service.id.clone(),
+                if run == first.id {
+                    "issuer-a"
+                } else {
+                    "issuer-b"
+                }
+                .into(),
+                vec![name.clone()],
+                None,
+            );
+            let mut services = vec![service];
+            let mut http_observations = vec![HttpObservation::new(
+                run,
+                name.clone(),
+                format!("https://{name}"),
+            )];
+            if run == second.id {
+                services.push(ServiceRecord::new(
+                    run,
+                    name.clone(),
+                    8080,
+                    "tcp".into(),
+                    true,
+                ));
+                http_observations.push(HttpObservation::new(
+                    run,
+                    name.clone(),
+                    format!("http://{name}:8080"),
+                ));
+            }
+            let bundle = ObservationBundle {
+                scan_id: run,
+                hostname: Hostname::new(name.clone(), source, None),
+                dns_records: Vec::new(),
+                services,
+                tls_records: vec![tls],
+                technologies: Vec::new(),
+                http_observations,
+            };
+            insert_bundle_batch(&mut conn, &[bundle]).unwrap();
+        }
+        for table in [
+            "service_observations",
+            "tls_observations",
+            "hostname_discoveries",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count,
+                if table == "service_observations" {
+                    3
+                } else {
+                    2
+                },
+                "{table}"
+            );
+        }
+        let first_source: String = conn
+            .query_row(
+                "SELECT source FROM hostname_discoveries WHERE scan_id = ?1",
+                params![first.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_source, "Seed");
+        let comparison =
+            crate::report::diff::compare_scan_runs(&conn, &first.id, &second.id).unwrap();
+        assert_eq!(comparison.changed_tls, vec!["api.example.com:443"]);
+        assert_eq!(comparison.new_services, vec!["api.example.com:8080/tcp"]);
+        assert_eq!(
+            comparison.new_endpoints,
+            vec!["http://api.example.com:8080"]
+        );
+        first.complete();
+        save_scan_run(&conn, &first).unwrap();
+        assert_eq!(
+            get_previous_compatible_scan(&conn, &second).unwrap(),
+            Some(first.id)
+        );
+        let other = ScanRun::new(vec!["other.com".into()], "same-config".into());
+        assert_eq!(get_previous_compatible_scan(&conn, &other).unwrap(), None);
+        let changed_config = ScanRun::new(vec!["example.com".into()], "different-config".into());
+        assert_eq!(
+            get_previous_compatible_scan(&conn, &changed_config).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_reports_failed_batches() {
+        let (tx, handle) = start_db_writer(":memory:".into());
+        let run = Uuid::new_v4();
+        tx.send(ObservationBundle {
+            scan_id: run,
+            hostname: Hostname::new("example.com".into(), DiscoverySource::Seed, None),
+            dns_records: Vec::new(),
+            services: Vec::new(),
+            tls_records: Vec::new(),
+            technologies: Vec::new(),
+            http_observations: vec![HttpObservation::new(
+                run,
+                "example.com".into(),
+                "https://example.com".into(),
+            )],
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(handle.await.unwrap().is_err());
     }
 }

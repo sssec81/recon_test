@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusChange {
     pub hostname: String,
+    pub endpoint_url: String,
     pub old_status: Option<u16>,
     pub new_status: Option<u16>,
 }
@@ -24,6 +25,11 @@ pub struct ScanDiffResult {
     pub scan_id_b: Uuid,
     pub new_subdomains: Vec<String>,
     pub removed_subdomains: Vec<String>,
+    pub new_endpoints: Vec<String>,
+    pub removed_endpoints: Vec<String>,
+    pub new_services: Vec<String>,
+    pub removed_services: Vec<String>,
+    pub changed_tls: Vec<String>,
     pub status_changes: Vec<StatusChange>,
     pub ip_changes: Vec<IpChange>,
     pub new_technologies: Vec<String>,
@@ -66,7 +72,7 @@ fn fetch_scan_http_obs(
     let mut map = HashMap::new();
     for obs in obs_iter {
         let o = obs?;
-        map.insert(o.hostname.clone(), o);
+        map.insert(o.url.clone(), o);
     }
     Ok(map)
 }
@@ -93,6 +99,7 @@ fn fetch_scan_dns_records(
             ips.push(r?);
         }
         ips.sort();
+        ips.dedup();
         map.insert(host.clone(), ips);
     }
 
@@ -119,6 +126,39 @@ fn fetch_scan_tech_obs(
     Ok(tech)
 }
 
+fn fetch_services(conn: &Connection, scan_id: &Uuid) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT hostname, port, protocol FROM service_observations WHERE scan_id = ?1")?;
+    let rows = stmt.query_map(params![scan_id.to_string()], |row| {
+        Ok(format!(
+            "{}:{}/{}",
+            row.get::<_, String>(0)?,
+            row.get::<_, u16>(1)?,
+            row.get::<_, String>(2)?
+        ))
+    })?;
+    rows.collect()
+}
+
+fn fetch_tls(conn: &Connection, scan_id: &Uuid) -> rusqlite::Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.hostname, s.port, t.issuer, t.subject_ans, t.expires_at
+        FROM tls_observations t JOIN service_observations s ON s.id = t.service_id
+        WHERE t.scan_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![scan_id.to_string()], |row| {
+        let key = format!("{}:{}", row.get::<_, String>(0)?, row.get::<_, u16>(1)?);
+        let value = format!(
+            "{}|{}|{}",
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?.unwrap_or_default()
+        );
+        Ok((key, value))
+    })?;
+    rows.collect()
+}
+
 pub fn compare_scan_runs(
     conn: &Connection,
     scan_id_a: &Uuid,
@@ -127,8 +167,15 @@ pub fn compare_scan_runs(
     let obs_a = fetch_scan_http_obs(conn, scan_id_a)?;
     let obs_b = fetch_scan_http_obs(conn, scan_id_b)?;
 
-    let keys_a: HashSet<String> = obs_a.keys().cloned().collect();
-    let keys_b: HashSet<String> = obs_b.keys().cloned().collect();
+    let endpoints_a: HashSet<String> = obs_a.keys().cloned().collect();
+    let endpoints_b: HashSet<String> = obs_b.keys().cloned().collect();
+    let keys_a: HashSet<String> = obs_a.values().map(|o| o.hostname.clone()).collect();
+    let keys_b: HashSet<String> = obs_b.values().map(|o| o.hostname.clone()).collect();
+    let mut new_endpoints: Vec<String> = endpoints_b.difference(&endpoints_a).cloned().collect();
+    let mut removed_endpoints: Vec<String> =
+        endpoints_a.difference(&endpoints_b).cloned().collect();
+    new_endpoints.sort();
+    removed_endpoints.sort();
 
     // 1. Added & Removed Subdomains
     let mut new_subdomains: Vec<String> = keys_b.difference(&keys_a).cloned().collect();
@@ -138,17 +185,19 @@ pub fn compare_scan_runs(
 
     // 2. HTTP Status Code Changes
     let mut status_changes = Vec::new();
-    for host in keys_a.intersection(&keys_b) {
-        let item_a = obs_a.get(host).unwrap();
-        let item_b = obs_b.get(host).unwrap();
+    for url in endpoints_a.intersection(&endpoints_b) {
+        let item_a = obs_a.get(url).unwrap();
+        let item_b = obs_b.get(url).unwrap();
         if item_a.status_code != item_b.status_code {
             status_changes.push(StatusChange {
-                hostname: host.clone(),
+                hostname: item_b.hostname.clone(),
+                endpoint_url: url.clone(),
                 old_status: item_a.status_code,
                 new_status: item_b.status_code,
             });
         }
     }
+    status_changes.sort_by(|a, b| a.endpoint_url.cmp(&b.endpoint_url));
 
     // 3. DNS IP Changes (Scoped per ScanRun)
     let all_hosts: Vec<String> = keys_a.union(&keys_b).cloned().collect();
@@ -167,6 +216,7 @@ pub fn compare_scan_runs(
             });
         }
     }
+    ip_changes.sort_by(|a, b| a.hostname.cmp(&b.hostname));
 
     // 4. New Technology Detections
     let tech_a: HashSet<String> = fetch_scan_tech_obs(conn, scan_id_a)?.into_iter().collect();
@@ -174,12 +224,35 @@ pub fn compare_scan_runs(
 
     let mut new_technologies: Vec<String> = tech_b.difference(&tech_a).cloned().collect();
     new_technologies.sort();
+    let services_a = fetch_services(conn, scan_id_a)?;
+    let services_b = fetch_services(conn, scan_id_b)?;
+    let mut new_services: Vec<String> = services_b.difference(&services_a).cloned().collect();
+    let mut removed_services: Vec<String> = services_a.difference(&services_b).cloned().collect();
+    new_services.sort();
+    removed_services.sort();
+    let tls_a = fetch_tls(conn, scan_id_a)?;
+    let tls_b = fetch_tls(conn, scan_id_b)?;
+    let mut changed_tls: Vec<String> = tls_a
+        .iter()
+        .filter_map(|(key, old)| {
+            tls_b
+                .get(key)
+                .filter(|new| *new != old)
+                .map(|_| key.clone())
+        })
+        .collect();
+    changed_tls.sort();
 
     Ok(ScanDiffResult {
         scan_id_a: *scan_id_a,
         scan_id_b: *scan_id_b,
         new_subdomains,
         removed_subdomains,
+        new_endpoints,
+        removed_endpoints,
+        new_services,
+        removed_services,
+        changed_tls,
         status_changes,
         ip_changes,
         new_technologies,

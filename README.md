@@ -19,9 +19,9 @@ An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqw
 - **Passive Recon (crt.sh)**: Automatic Certificate Transparency log querying (enabled by default with `--passive true`).
 - **TLS SAN Feedback Expansion**: Automatically extracts Subject Alternative Names (SANs) from TLS certs and queues in-scope targets dynamically.
 - **Web Tech Fingerprinting**: Technology detection with confidence scores and evidence tracing.
-- **Attack Surface Scan Diffing**: Historical diff engine (`--diff-last` or `--diff <SCAN_A> <SCAN_B>`) tracking new/removed subdomains, status code shifts, DNS IP changes, and new technologies.
+- **Attack Surface Scan Diffing**: Historical diff engine (`--diff-last` or `--diff <SCAN_A> <SCAN_B>`) tracking subdomains, endpoints, services, TLS metadata, status codes, DNS IPs, and technologies. `--diff-last` uses the previous completed scan with the same scope, seed targets, passive setting, and scheme strategy.
 - **Optional AI Analysis**: Attack surface assessment using local Ollama or Anthropic models via `--llm-analyze`.
-- **SQLite Storage**: Persistent local storage in SQLite (`recon_data.db`) in WAL mode with FK safety and thread-safe batch writing.
+- **SQLite Storage**: Persistent local storage in SQLite (`recon_data.db`) in WAL mode with scan-specific service, TLS, and hostname discovery history.
 - **Data Exporting**: Export scan results directly to JSON (`--export-json`), CSV (`--export-csv`), or diff JSON (`--export-diff-json`).
 
 ## Installation & Build
@@ -44,9 +44,9 @@ cargo build --release
 | `-c, --concurrency <N>` | Maximum concurrent scan tasks | `20` |
 | `--passive [true\|false]` | Ingest passive Certificate Transparency logs via crt.sh | `true` |
 | `--scheme-strategy <STRATEGY>` | Probing scheme (`https-first`, `https-only`, `both-parallel`) | `https-first` |
-| `--diff-last` | Automatically diff current scan run against previous finished run | `false` |
+| `--diff-last` | Diff against the previous compatible finished run | `false` |
 | `--diff <UUID_A> <UUID_B>` | Compare specific historical scan runs | None |
-| `--llm-analyze` | Enable local AI attack surface analysis via Ollama | `false` |
+| `--llm-analyze` | Enable optional AI attack surface analysis | `false` |
 | `--ollama-model <MODEL>` | Local Ollama model name | `llama3:8b` |
 | `--ollama-url <URL>` | Local Ollama API endpoint | `http://localhost:11434` |
 | `--llm-backend <BACKEND>` | AI backend (`ollama` or `anthropic`) | `ollama` |
@@ -74,6 +74,12 @@ For Anthropic analysis, set `ANTHROPIC_API_KEY` and add `--llm-backend anthropic
 ```bash
 cargo run -- -t example.com --diff-last --llm-analyze
 ```
+
+## Database migration
+
+Existing databases remain usable. Older service and TLS rows stay in their legacy tables because they did not contain a scan ID; new observations use scan-specific tables. Re-scan a target to build comparable service and TLS history.
+
+Passive discovery errors now fail the run instead of producing an incomplete successful scan. Use `--passive false` when crt.sh is unavailable.
 
 ## License
 MIT
