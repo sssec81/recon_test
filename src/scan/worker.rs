@@ -101,12 +101,9 @@ pub async fn probe(work: WorkItem, context: WorkerContext) -> Result<(), String>
 
     let endpoints = endpoint_candidates(&host, &open_ports, strategy);
     if endpoints.is_empty() {
-        let result = scanner::probe_subdomain(&client, &host, strategy).await;
-        let url = result
-            .final_url
-            .clone()
-            .unwrap_or_else(|| format!("https://{host}"));
-        emit_http(scan_id, &name, url, result, &bus).await?;
+        for (url, result) in scanner::probe_subdomain(&client, &host, strategy).await {
+            emit_http(scan_id, &name, url, result, &bus).await?;
+        }
     } else if strategy == SchemeStrategy::BothParallel {
         let results = futures_util::future::join_all(
             endpoints

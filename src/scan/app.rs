@@ -27,7 +27,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .pool_max_idle_per_host(10)
         .user_agent("recon_test/1.0.0")
-        .danger_accept_invalid_certs(true)
         .build()?;
 
     // Load targets before creating a scan run.
@@ -270,20 +269,31 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 match triage::ai::analyze(&http_client, &provider, &review).await {
                     Ok(result) => {
                         match triage::ai::write(&result, std::path::Path::new(&args.triage_dir)) {
-                            Ok(()) => println!("🤖 AI suggestions saved for {} finding(s).", result.analyzed_findings),
-                            Err(error) => eprintln!("⚠️  Could not save candidate AI triage: {error}"),
+                            Ok(()) => println!(
+                                "🤖 AI suggestions saved for {} finding(s).",
+                                result.analyzed_findings
+                            ),
+                            Err(error) => {
+                                eprintln!("⚠️  Could not save candidate AI triage: {error}")
+                            }
                         }
                     }
                     Err(error) => {
                         eprintln!("⚠️  Candidate AI triage unavailable: {error}");
-                        if let Err(write_error) = triage::ai::write_unavailable(review.scan_id, std::path::Path::new(&args.triage_dir)) {
+                        if let Err(write_error) = triage::ai::write_unavailable(
+                            review.scan_id,
+                            std::path::Path::new(&args.triage_dir),
+                        ) {
                             eprintln!("⚠️  Could not save AI triage status: {write_error}");
                         }
                     }
                 }
             } else {
                 eprintln!("⚠️  Candidate AI triage skipped: ANTHROPIC_API_KEY is missing.");
-                if let Err(error) = triage::ai::write_unavailable(review.scan_id, std::path::Path::new(&args.triage_dir)) {
+                if let Err(error) = triage::ai::write_unavailable(
+                    review.scan_id,
+                    std::path::Path::new(&args.triage_dir),
+                ) {
                     eprintln!("⚠️  Could not save AI triage status: {error}");
                 }
             }

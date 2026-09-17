@@ -206,10 +206,15 @@ pub fn write(result: &AiTriage, output_root: &Path) -> Result<(), Box<dyn std::e
         dir.join("ai_triage.json"),
         serde_json::to_vec_pretty(result)?,
     )?;
-    fs::write(dir.join("ai_triage_status.json"), b"{\"status\":\"complete\"}\n")?;
+    fs::write(
+        dir.join("ai_triage_status.json"),
+        b"{\"status\":\"complete\"}\n",
+    )?;
     let mut markdown = format!(
         "# AI review suggestions\n\nAdvisory only. Scanner confidence and findings are unchanged. Backend: `{}`. Analyzed {} of {} findings.\n\n",
-        markdown_text(&result.backend), result.analyzed_findings, result.total_findings
+        markdown_text(&result.backend),
+        result.analyzed_findings,
+        result.total_findings
     );
     for advice in &result.advice {
         markdown.push_str(&format!("## {} ({:?})\n\n**Why review:** {}\n\n**Manual check:** {}\n\n**False-positive risk:** {}\n\n",
@@ -227,19 +232,35 @@ pub fn write(result: &AiTriage, output_root: &Path) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-pub fn write_unavailable(scan_id: Uuid, output_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_unavailable(
+    scan_id: Uuid,
+    output_root: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = output_root.join(scan_id.to_string());
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("ai_triage_status.json"), b"{\"status\":\"unavailable\"}\n")?;
-    let mut review = fs::OpenOptions::new().append(true).open(dir.join("review.md"))?;
-    writeln!(review, "Optional AI triage was unavailable. Deterministic findings above are unchanged.")?;
+    fs::write(
+        dir.join("ai_triage_status.json"),
+        b"{\"status\":\"unavailable\"}\n",
+    )?;
+    let mut review = fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("review.md"))?;
+    writeln!(
+        review,
+        "Optional AI triage was unavailable. Deterministic findings above are unchanged."
+    )?;
     Ok(())
 }
 
 fn markdown_text(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-        .replace(['\r', '\n'], " ").replace('`', "'")
-        .replace('[', "\\[").replace(']', "\\]")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace(['\r', '\n'], " ")
+        .replace('`', "'")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@ use std::time::Instant;
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanResult {
-    pub final_url: Option<String>,
     pub status_code: Option<u16>,
     pub title: Option<String>,
     pub server: Option<String>,
@@ -22,25 +21,16 @@ pub enum SchemeStrategy {
 }
 
 fn extract_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let start_tag = "<title";
-    let end_tag = "</title>";
-
-    if let Some(start_offset) = lower.find(start_tag) {
-        let tag_suffix = &html[start_offset..];
-        if let Some(tag_close) = tag_suffix.find('>') {
-            let content_start = start_offset + tag_close + 1;
-            let remaining_lower = &lower[content_start..];
-            if let Some(end_offset) = remaining_lower.find(end_tag) {
-                let raw_title = &html[content_start..content_start + end_offset];
-                let clean_title = raw_title.trim().replace('\n', " ").replace('\r', "");
-                if !clean_title.is_empty() {
-                    return Some(clean_title);
-                }
-            }
-        }
-    }
-    None
+    let document = scraper::Html::parse_document(html);
+    let selector = scraper::Selector::parse("title").ok()?;
+    document.select(&selector).next().and_then(|node| {
+        let title = node
+            .text()
+            .collect::<String>()
+            .trim()
+            .replace(['\n', '\r'], " ");
+        (!title.is_empty()).then_some(title)
+    })
 }
 
 pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> {
@@ -50,7 +40,6 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
     let response = client.get(url).send().await.ok()?;
     let rtt_ms = start.elapsed().as_millis() as u64;
 
-    let final_url = Some(response.url().as_str().to_string());
     let status_code = Some(response.status().as_u16());
     let headers = response.headers().clone();
     let server = headers
@@ -79,7 +68,6 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
     let title = extract_title(&body_str);
 
     Some(ScanResult {
-        final_url,
         status_code,
         title,
         server,
@@ -93,51 +81,52 @@ pub async fn probe_subdomain(
     client: &Client,
     subdomain: &str,
     strategy: SchemeStrategy,
-) -> ScanResult {
+) -> Vec<(String, ScanResult)> {
     if subdomain.starts_with("http://") || subdomain.starts_with("https://") {
-        return probe_single_url(client, subdomain)
-            .await
-            .unwrap_or_default();
+        return vec![(
+            subdomain.to_string(),
+            probe_single_url(client, subdomain)
+                .await
+                .unwrap_or_default(),
+        )];
     }
 
     match strategy {
         SchemeStrategy::HttpsOnly => {
             let url = format!("https://{}", subdomain);
-            probe_single_url(client, &url).await.unwrap_or_default()
+            let result = probe_single_url(client, &url).await.unwrap_or_default();
+            vec![(url, result)]
         }
         SchemeStrategy::HttpsFirst => {
             let https_url = format!("https://{}", subdomain);
             if let Some(res) = probe_single_url(client, &https_url).await {
-                return res;
+                return vec![(https_url, res)];
             }
             let http_url = format!("http://{}", subdomain);
-            probe_single_url(client, &http_url)
+            let result = probe_single_url(client, &http_url)
                 .await
-                .unwrap_or_default()
+                .unwrap_or_default();
+            vec![(http_url, result)]
         }
         SchemeStrategy::BothParallel => {
             let https_url = format!("https://{}", subdomain);
             let http_url = format!("http://{}", subdomain);
-            race_urls(client, &https_url, &http_url).await
+            let (https, http) = tokio::join!(
+                probe_single_url(client, &https_url),
+                probe_single_url(client, &http_url)
+            );
+            vec![
+                (https_url, https.unwrap_or_default()),
+                (http_url, http.unwrap_or_default()),
+            ]
         }
     }
-}
-
-async fn race_urls(client: &Client, first_url: &str, second_url: &str) -> ScanResult {
-    let first = probe_single_url(client, first_url);
-    let second = probe_single_url(client, second_url);
-    tokio::pin!(first, second);
-    tokio::select! {
-        result = &mut first => match result { Some(r) => Some(r), None => second.await },
-        result = &mut second => match result { Some(r) => Some(r), None => first.await },
-    }
-    .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
@@ -153,35 +142,36 @@ mod tests {
 
         let no_title = "<html><body>No Title</body></html>";
         assert_eq!(extract_title(no_title), None);
+        assert_eq!(
+            extract_title("<html><body>İ</body><title>Unicode ✓</title></html>"),
+            Some("Unicode ✓".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn parallel_probe_returns_before_slow_endpoint() {
-        let fast = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fast_url = format!("http://{}", fast.local_addr().unwrap());
-        let slow_url = format!("http://{}", slow.local_addr().unwrap());
-        let fast_task = tokio::spawn(async move {
-            let (mut socket, _) = fast.accept().await.unwrap();
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
+    async fn both_parallel_keeps_http_when_https_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1];
+                socket.read_exact(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
         });
-        let slow_task = tokio::spawn(async move {
-            let (mut socket, _) = slow.accept().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
-        let client = Client::new();
-        let start = Instant::now();
-        let result = race_urls(&client, &slow_url, &fast_url).await;
-        assert_eq!(result.status_code, Some(200));
-        assert!(start.elapsed() < std::time::Duration::from_millis(400));
-        fast_task.await.unwrap();
-        slow_task.abort();
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let results = probe_subdomain(&client, &host, SchemeStrategy::BothParallel).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, format!("https://{host}"));
+        assert_eq!(results[1].0, format!("http://{host}"));
+        assert_eq!(results[1].1.status_code, Some(200));
+        server.await.unwrap();
     }
 }

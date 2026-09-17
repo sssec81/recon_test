@@ -27,6 +27,8 @@ An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqw
 - **Optional Evidence Triage**: Crawl discovered in-scope web pages, identify a small set of review candidates, repeat safe checks, and save evidence locally with `--triage`.
 
 ## Installation & Build
+Rust with Cargo is required. Run scans only against hosts you are authorized to test.
+
 ```bash
 # Clone the repository
 git clone https://github.com/sssec81/recon_test.git
@@ -35,6 +37,24 @@ cd recon_test
 # Build release binary
 cargo build --release
 ```
+
+For a first scan that does not depend on crt.sh, run:
+
+```bash
+cargo run --release -- --target example.com --scope example.com --passive false
+```
+
+The scanner writes `recon_data.db` in the current directory unless `--db` is set. An IP target requires that exact IP in `--scope`; a domain scope includes the root and its subdomains. With `--file`, specify `--scope` explicitly when the listed hosts share a root domain and you want CT or TLS SAN discoveries under that root. Otherwise each listed host becomes an exact scope root, including its own subdomains.
+
+## How a scan works
+
+1. Normalize target names and enforce scope before scheduling. Duplicate names are scanned once per run.
+2. Optionally query crt.sh for each domain scope root. A failed query fails the run; use `--passive false` if passive discovery is unavailable.
+3. Resolve DNS, test TCP ports `80`, `443`, `8000`, `8080`, and `8443`, inspect TLS certificates on `443` and `8443`, and schedule in-scope SAN names.
+4. Probe web endpoints, fingerprint technologies, and batch observations into SQLite. Target redirects are followed only while they remain in scope.
+5. Optionally run bounded triage, export HTTP observations, compare scans, and request AI analysis.
+
+`https-first` tries HTTPS before HTTP when no web port was detected; when ports are detected, it probes each detected web endpoint. `https-only` skips plain HTTP. `both-parallel` probes both schemes when no web port was detected and also probes both schemes on alternate web ports. A failed request is stored as an HTTP observation without a status code. The initial port check can miss a reachable endpoint; the fallback still attempts the configured scheme or schemes.
 
 ## CLI Options & Usage Examples
 
@@ -67,6 +87,8 @@ cargo build --release
 | `--export-csv <PATH>` | Export scan observations to CSV file | None |
 | `--export-diff-json <PATH>` | Export scan diff results to JSON file | None |
 | `--db <PATH>` | SQLite database file | `recon_data.db` |
+
+`--target` takes precedence if both `--target` and `--file` are supplied. `--diff` still performs a new scan before comparing the two requested historical IDs. JSON and CSV exports contain this run's HTTP observations; they are not complete exports of every database table.
 
 ### Scan single target with active scope and passive CT logs:
 ```bash
@@ -102,6 +124,12 @@ cargo run -- -t example.com --diff-last --llm-analyze
 Existing databases remain usable. Older service and TLS rows stay in their legacy tables because they did not contain a scan ID; new observations use scan-specific tables. Re-scan a target to build comparable service and TLS history.
 
 Passive discovery errors now fail the run instead of producing an incomplete successful scan. Use `--passive false` when crt.sh is unavailable.
+
+## Verification and limitations
+
+Run `cargo test --all-targets` for the local test suite. It uses loopback HTTP servers and an in-memory SQLite database; it does not scan public targets. Run `cargo fmt --check` to check formatting.
+
+This is reconnaissance and review assistance, not a vulnerability verdict. Triage uses GET requests, skips common action paths and sensitive query names, and limits page bytes, time, requests, and review entries. A GET endpoint can still have side effects, so set limits appropriate to the target. Review candidates require manual validation, especially object ownership and authorization. TLS certificate validation is relaxed for target probes to collect metadata from staging or misconfigured endpoints; crt.sh and AI API requests use normal certificate validation. Scan comparison requires two completed runs with comparable scope and settings. Optional AI output is advisory and does not change deterministic triage findings.
 
 ## License
 MIT
