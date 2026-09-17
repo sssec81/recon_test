@@ -1,60 +1,62 @@
 # recon_test 🚀
 
-An asynchronous, modular Rust bug bounty recon scanner powered by `tokio`, `reqwest`, `rusqlite`, and `clap`.
+`recon_test` is a Rust command-line tool for mapping the web attack surface of domains or IPs you are authorized to test. It discovers in-scope hosts, checks DNS and web services, and saves scan history in SQLite. You can compare runs or create a small local review queue with optional triage.
 
-## Code layout
+## Quick start
 
-| Directory | Responsibility |
-| --- | --- |
-| `src/main.rs`, `src/cli.rs` | Entry point, CLI arguments, and target file loading |
-| `src/scan/` | Scan coordination, scheduling, per-host work, event assembly, and scope checks |
-| `src/probes/` | Certificate, DNS, TCP, TLS, HTTP, and technology probes |
-| `src/storage/` | Observation models and SQLite persistence |
-| `src/report/` | Scan comparison, export, and optional AI analysis |
-| `src/triage/` | Bounded crawl, deterministic candidate checks, verification, and local review packages |
-
-## Features
-- **Concurrent Async Probing**: High-speed subdomain probing with Tokio and `reqwest`.
-- **Concurrency Rate Limiting**: Built-in `Semaphore` limit (`-c, --concurrency`) to prevent socket exhaustion.
-- **Scope Enforcement & Scheduler**: `ScopePolicy` filter (`-s, --scope`), in-scope HTTP redirects, and fan-in hostname deduplication.
-- **Passive Recon (crt.sh)**: Automatic Certificate Transparency log querying (enabled by default with `--passive true`).
-- **TLS SAN Feedback Expansion**: Automatically extracts Subject Alternative Names (SANs) from TLS certs and queues in-scope targets dynamically.
-- **Web Tech Fingerprinting**: Technology detection with confidence scores and evidence tracing.
-- **Attack Surface Scan Diffing**: Historical diff engine (`--diff-last` or `--diff <SCAN_A> <SCAN_B>`) tracking subdomains, endpoints, services, TLS metadata, status codes, DNS IPs, and technologies. `--diff-last` uses the previous completed scan with the same scope, seed targets, passive setting, and scheme strategy.
-- **Optional AI Analysis**: Attack surface assessment using local Ollama or Anthropic models via `--llm-analyze`.
-- **SQLite Storage**: Persistent local storage in SQLite (`recon_data.db`) in WAL mode with scan-specific service, TLS, and hostname discovery history.
-- **Data Exporting**: Export scan results directly to JSON (`--export-json`), CSV (`--export-csv`), or diff JSON (`--export-diff-json`).
-- **Optional Evidence Triage**: Crawl discovered in-scope web pages, identify a small set of review candidates, repeat safe checks, and save evidence locally with `--triage`.
-
-## Installation & Build
-Rust with Cargo is required. Run scans only against hosts you are authorized to test.
+Install Rust and Cargo, then build the project:
 
 ```bash
-# Clone the repository
 git clone https://github.com/sssec81/recon_test.git
 cd recon_test
-
-# Build release binary
 cargo build --release
 ```
 
-For a first scan that does not depend on crt.sh, run:
+Run a first scan without the optional crt.sh lookup:
 
 ```bash
 cargo run --release -- --target example.com --scope example.com --passive false
 ```
 
-The scanner writes `recon_data.db` in the current directory unless `--db` is set. An IP target requires that exact IP in `--scope`; a domain scope includes the root and its subdomains. With `--file`, specify `--scope` explicitly when the listed hosts share a root domain and you want CT or TLS SAN discoveries under that root. Otherwise each listed host becomes an exact scope root, including its own subdomains.
+Results go to `recon_data.db` in the current directory. Use `--db` to choose another path. Only scan hosts you have permission to test.
 
 ## How a scan works
 
-1. Normalize target names and enforce scope before scheduling. Duplicate names are scanned once per run.
-2. Optionally query crt.sh for each domain scope root. A failed query fails the run; use `--passive false` if passive discovery is unavailable.
-3. Resolve DNS, test TCP ports `80`, `443`, `8000`, `8080`, and `8443`, inspect TLS certificates on `443` and `8443`, and schedule in-scope SAN names.
-4. Probe web endpoints, fingerprint technologies, and batch observations into SQLite. Target redirects are followed only while they remain in scope.
-5. Optionally run bounded triage, export HTTP observations, compare scans, and request AI analysis.
+```mermaid
+flowchart TD
+    A["Targets and scope"] --> B["Discover hosts"]
+    B --> C["Check scope and remove duplicates"]
+    C --> D["Probe DNS, ports, TLS, and HTTP"]
+    D --> E["Save results in SQLite"]
+    D -->|In-scope certificate names| C
+    E --> F["Compare runs or export"]
+    E --> G["Optional page triage"]
+    E --> I["Optional AI analysis"]
+    G --> H["Local review files"]
+    G --> I
+```
 
-`https-first` tries HTTPS before HTTP when no web port was detected; when ports are detected, it probes each detected web endpoint. `https-only` skips plain HTTP. `both-parallel` probes both schemes when no web port was detected and also probes both schemes on alternate web ports. A failed request is stored as an HTTP observation without a status code. The initial port check can miss a reachable endpoint; the fallback still attempts the configured scheme or schemes.
+Host discovery uses your targets and, by default, certificate records from crt.sh. The scanner probes ports `80`, `443`, `8000`, `8080`, and `8443`. It follows HTTP redirects only within scope. A failed crt.sh request fails the scan; use `--passive false` when you want to skip crt.sh.
+
+A domain scope includes that domain and its subdomains. An IP scope includes only that IP. With `--file`, set `--scope` to the authorized root domain if you want discoveries across that root; otherwise each file entry becomes a scope root.
+
+Choose a web probe mode with `--scheme-strategy`:
+
+- `https-first` (default): try HTTPS, then HTTP if HTTPS fails. When web ports are detected, probe each detected endpoint.
+- `https-only`: skip plain HTTP.
+- `both-parallel`: try both schemes together when no web port is detected; also try both on alternate web ports.
+
+The scanner tries the selected scheme even if the port check missed it. Failed web requests are saved without a status code.
+
+## Code layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/main.rs`, `src/cli.rs` | Start the CLI and read targets |
+| `src/scan/`, `src/probes/` | Enforce scope, schedule work, and probe hosts |
+| `src/storage/` | Save observations in SQLite |
+| `src/report/` | Compare scans, export data, and request optional AI analysis |
+| `src/triage/` | Crawl pages and build local review files |
 
 ## CLI Options & Usage Examples
 
