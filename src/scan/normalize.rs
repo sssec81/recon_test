@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalEndpoint {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub path: String,
+    pub canonical_url: String,
+}
+
+pub fn normalize_endpoint(input: &str, base: Option<&reqwest::Url>) -> Option<CanonicalEndpoint> {
+    let mut url = match base {
+        Some(base) => base.join(input).ok()?,
+        None => reqwest::Url::parse(input).ok()?,
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    url.set_fragment(None);
+    let host = NormalizedHostname::new(url.host_str()?)?
+        .as_str()
+        .to_string();
+    let scheme = url.scheme().to_ascii_lowercase();
+    let port = url
+        .port()
+        .filter(|port| !((scheme == "http" && *port == 80) || (scheme == "https" && *port == 443)));
+    let path = if url.path().is_empty() {
+        "/".into()
+    } else {
+        url.path().to_string()
+    };
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let canonical_url = match port {
+        Some(port) => format!("{scheme}://{authority}:{port}{path}"),
+        None => format!("{scheme}://{authority}{path}"),
+    };
+    Some(CanonicalEndpoint {
+        scheme,
+        host,
+        port,
+        path,
+        canonical_url,
+    })
+}
+
+pub fn endpoint_id(endpoint: &CanonicalEndpoint) -> String {
+    format!("{:x}", Sha256::digest(endpoint.canonical_url.as_bytes()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NormalizedHostname(pub String);
@@ -107,5 +163,15 @@ mod tests {
         ] {
             assert!(NormalizedHostname::new(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn canonical_endpoint_preserves_raw_query_outside_identity() {
+        let first =
+            normalize_endpoint("HTTPS://API.Example.com:443/api/users?id=123#top", None).unwrap();
+        let second = normalize_endpoint("https://api.example.com/api/users?id=456", None).unwrap();
+        assert_eq!(first.canonical_url, "https://api.example.com/api/users");
+        assert_eq!(first.canonical_url, second.canonical_url);
+        assert!(normalize_endpoint("mailto:test@example.com", None).is_none());
     }
 }

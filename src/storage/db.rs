@@ -39,6 +39,20 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         )",
         [],
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS endpoints (
+            id TEXT PRIMARY KEY, scheme TEXT NOT NULL, host TEXT NOT NULL, port INTEGER,
+            path TEXT NOT NULL, canonical_url TEXT NOT NULL UNIQUE,
+            first_seen_scan TEXT NOT NULL, last_seen_scan TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS endpoint_observations (
+            endpoint_id TEXT NOT NULL, scan_id TEXT NOT NULL, raw_url TEXT NOT NULL,
+            source TEXT NOT NULL, source_reference TEXT,
+            PRIMARY KEY(endpoint_id, scan_id, raw_url, source),
+            FOREIGN KEY(endpoint_id) REFERENCES endpoints(id),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        );",
+    )?;
 
     // 2. Hostnames table
     conn.execute(
@@ -190,6 +204,23 @@ pub fn save_provider_status(
     Ok(())
 }
 
+#[cfg(test)]
+pub fn save_endpoint_observation(
+    conn: &Connection,
+    scan_id: &Uuid,
+    raw_url: &str,
+    source: &str,
+    source_reference: Option<&str>,
+) -> Result<()> {
+    let Some(endpoint) = crate::scan::normalize::normalize_endpoint(raw_url, None) else {
+        return Ok(());
+    };
+    let id = crate::scan::normalize::endpoint_id(&endpoint);
+    conn.execute("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan", params![id, endpoint.scheme, endpoint.host, endpoint.port, endpoint.path, endpoint.canonical_url, scan_id.to_string()])?;
+    conn.execute("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)", params![crate::scan::normalize::endpoint_id(&endpoint), scan_id.to_string(), raw_url, source, source_reference])?;
+    Ok(())
+}
+
 pub fn save_scan_run(conn: &Connection, scan_run: &ScanRun) -> Result<()> {
     let root_scope_str = serde_json::to_string(&scan_run.root_scope).unwrap_or_default();
     conn.execute(
@@ -290,6 +321,8 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                content_length = EXCLUDED.content_length,
                observed_at = EXCLUDED.observed_at",
         )?;
+        let mut stmt_endpoint = tx.prepare("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan")?;
+        let mut stmt_endpoint_observation = tx.prepare("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)")?;
 
         for bundle in bundles {
             // Save Hostname
@@ -376,6 +409,26 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                     http.content_length.map(|c| c as i64),
                     http.observed_at.to_rfc3339(),
                 ])?;
+                if let Some(endpoint) = crate::scan::normalize::normalize_endpoint(&http.url, None)
+                {
+                    let endpoint_id = crate::scan::normalize::endpoint_id(&endpoint);
+                    stmt_endpoint.execute(params![
+                        endpoint_id,
+                        endpoint.scheme,
+                        endpoint.host,
+                        endpoint.port,
+                        endpoint.path,
+                        endpoint.canonical_url,
+                        bundle.scan_id.to_string()
+                    ])?;
+                    stmt_endpoint_observation.execute(params![
+                        crate::scan::normalize::endpoint_id(&endpoint),
+                        bundle.scan_id.to_string(),
+                        http.url,
+                        "http_probe",
+                        Option::<String>::None
+                    ])?;
+                }
             }
         }
     }
@@ -684,5 +737,39 @@ mod tests {
             "legacy"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn endpoint_identity_dedupes_raw_observations_with_provenance() {
+        let conn = init_db(":memory:").unwrap();
+        let run = ScanRun::new(vec!["example.com".into()], "test".into());
+        save_scan_run(&conn, &run).unwrap();
+        save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://API.example.com:443/api/users?id=1",
+            "crawler",
+            Some("page"),
+        )
+        .unwrap();
+        save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://api.example.com/api/users?id=2",
+            "javascript",
+            Some("app.js"),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM endpoints", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM endpoint_observations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }
