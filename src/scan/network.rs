@@ -56,6 +56,10 @@ impl ProbePolicy {
             .acquire_owned()
             .await
             .map_err(|_| RequestError::Closed)?;
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            drop(permit);
+            return Err(RequestError::Deadline);
+        }
         match kind {
             ProbeKind::Dns => self
                 .accounting
@@ -184,6 +188,15 @@ impl RequestScheduler {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(RequestError::Deadline.into());
         }
+        let _permit = self
+            .concurrency
+            .acquire()
+            .await
+            .map_err(|_| RequestError::Closed)?;
+        self.pace(url).await?;
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(RequestError::Deadline.into());
+        }
         let mut current = self.remaining.load(Ordering::Relaxed);
         loop {
             if current == 0 {
@@ -199,12 +212,6 @@ impl RequestScheduler {
                 Err(next) => current = next,
             }
         }
-        let _permit = self
-            .concurrency
-            .acquire()
-            .await
-            .map_err(|_| RequestError::Closed)?;
-        self.pace(url).await?;
         Ok(self.client.get(url.clone()).send().await?)
     }
 }
@@ -258,6 +265,27 @@ mod tests {
         assert_eq!(p.accounting.dns_operations.load(Ordering::SeqCst), 1);
         assert_eq!(p.accounting.tcp_operations.load(Ordering::SeqCst), 0);
         assert_eq!(p.accounting.tls_operations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_policy_does_not_count_work_that_expires_waiting_for_a_permit() {
+        let p = ProbePolicy::new(
+            ScopePolicy::new(vec!["example.com".into()]),
+            1,
+            Some(Instant::now() + Duration::from_millis(30)),
+        );
+        let held = p.acquire("example.com", ProbeKind::Dns).await.unwrap();
+        let waiting = {
+            let p = p.clone();
+            tokio::spawn(async move { p.acquire("example.com", ProbeKind::Tcp).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(RequestError::Deadline)
+        ));
+        assert_eq!(p.accounting.tcp_operations.load(Ordering::SeqCst), 0);
     }
 
     fn scheduler(
@@ -319,6 +347,25 @@ mod tests {
         let started = Instant::now();
         s.pace(&url).await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn scheduler_does_not_spend_budget_when_deadline_expires_waiting() {
+        let s = scheduler(1, Some(Instant::now() + Duration::from_millis(30)), 0, 0);
+        let held = s.concurrency.clone().acquire_owned().await.unwrap();
+        let url: Url = "http://example.com/".parse().unwrap();
+        let waiting = {
+            let s = s.clone();
+            tokio::spawn(async move { s.get(&url).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let error = waiting.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RequestError>(),
+            Some(RequestError::Deadline)
+        ));
+        assert_eq!(s.remaining.load(Ordering::SeqCst), 1);
     }
 
     async fn redirect_server(
