@@ -66,6 +66,7 @@ The scanner tries the selected scheme even if the port check missed it. Failed w
 | `-s, --scope <SCOPE>...` | Authorized root scope domain(s) | Target input domain |
 | `-f, --file <PATH>` | File containing target subdomains (one per line) | None |
 | `-c, --concurrency <N>` | Maximum concurrent scan tasks | `20` |
+| `--max-targets <N>` | Maximum distinct hosts scheduled; the scan fails if discovery exceeds this limit | `10000` |
 | `--passive [true\|false]` | Ingest passive Certificate Transparency logs via crt.sh | `true` |
 | `--scheme-strategy <STRATEGY>` | Probing scheme (`https-first`, `https-only`, `both-parallel`) | `https-first` |
 | `--diff-last` | Diff against the previous compatible finished run | `false` |
@@ -111,6 +112,8 @@ cargo run --release -- -t example.com --scope example.com --passive false --tria
 ```
 
 Triage starts after recon. Its time and request limits apply to the triage phase only. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, `endpoints.json`, `anomalies.json`, `suppressed.json`, and `evidence/`. The endpoint inventory records route templates, query and form field names, discovery sources, observed statuses, and content types. `suppressed.json` records candidates rejected by repeat or control checks, budget limits, and the review queue cap. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
+
+Triage also rechecks initial web endpoints that returned a server error, so a detailed error page at the scan entry point can enter the review queue.
 
 Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation.
 

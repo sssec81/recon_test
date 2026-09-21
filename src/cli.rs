@@ -27,6 +27,10 @@ pub struct Args {
     #[arg(short, long, default_value_t = 20, value_parser = parse_positive_usize)]
     pub concurrency: usize,
 
+    /// Maximum distinct hosts scheduled in one scan
+    #[arg(long, default_value_t = 10000, value_parser = parse_positive_usize)]
+    pub max_targets: usize,
+
     /// Enable passive Certificate Transparency reconnaissance
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub passive: bool,
@@ -131,7 +135,7 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
         .parse::<usize>()
         .map_err(|_| "expected a positive integer".to_string())?;
     if count == 0 {
-        Err("concurrency must be at least 1".to_string())
+        Err("value must be at least 1".to_string())
     } else {
         Ok(count)
     }
@@ -167,5 +171,9 @@ mod tests {
     #[test]
     fn rejects_zero_concurrency() {
         assert!(Args::try_parse_from(["recon_test", "-t", "example.com", "-c", "0"]).is_err());
+        assert!(
+            Args::try_parse_from(["recon_test", "-t", "example.com", "--max-targets", "0"])
+                .is_err()
+        );
     }
 }

@@ -52,8 +52,7 @@ pub async fn report(
             if let (Some(a), Some(b)) = (id_a, id_b) {
                 Some((a, b))
             } else {
-                eprintln!("❌ Invalid UUID parameters supplied for --diff.");
-                None
+                return Err("Invalid UUID parameters supplied for --diff".into());
             }
         } else {
             None
@@ -135,7 +134,7 @@ pub async fn report(
                     );
                 }
             }
-            Err(e) => eprintln!("❌ Failed to calculate scan diff: {}", e),
+            Err(e) => return Err(format!("Failed to calculate scan diff: {e}").into()),
         }
     }
 

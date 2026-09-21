@@ -86,7 +86,7 @@ pub async fn run(
     for observation in observations {
         if observation
             .status_code
-            .is_some_and(|status| (200..400).contains(&status))
+            .is_some_and(|status| (200..400).contains(&status) || (500..600).contains(&status))
             && let Ok(mut url) = Url::parse(&observation.url)
         {
             url.set_fragment(None);
@@ -258,6 +258,78 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn triages_server_error_at_scan_entry_point() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let Ok(length) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let is_control =
+                        String::from_utf8_lossy(&request[..length]).contains("__recon_control");
+                    let (status, body) = if is_control {
+                        ("200 OK", "healthy")
+                    } else {
+                        (
+                            "500 Internal Server Error",
+                            "Traceback (most recent call last)",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let scan_id = Uuid::new_v4();
+        let url = format!("http://{address}/");
+        let observations = vec![
+            HttpObservation::new(scan_id, "127.0.0.1".into(), url).with_response(
+                Some(500),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let output_dir = std::env::temp_dir().join(format!("recon_error_test_{scan_id}"));
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let review = run(
+            &client,
+            &ScopePolicy::new(vec!["127.0.0.1".into()]),
+            &observations,
+            TriageConfig {
+                max_pages: 1,
+                max_depth: 0,
+                max_requests: 8,
+                max_minutes: 1,
+                max_findings: 1,
+                delay_ms: 0,
+                output_dir: output_dir.clone(),
+            },
+            scan_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.pages_crawled, 1);
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].category, "stack_trace");
+        std::fs::remove_dir_all(output_dir).unwrap();
+        server.abort();
+    }
 
     #[tokio::test]
     async fn local_crawl_verifies_and_writes_review_queue() {

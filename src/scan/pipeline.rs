@@ -46,17 +46,33 @@ pub enum ReconEvent {
 #[derive(Clone)]
 pub struct Scheduler {
     scope: ScopePolicy,
-    seen_hostnames: Arc<Mutex<HashSet<NormalizedHostname>>>,
+    state: Arc<Mutex<SchedulerState>>,
     work_tx: mpsc::UnboundedSender<WorkItem>,
+    max_targets: usize,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    seen_hostnames: HashSet<NormalizedHostname>,
+    limit_exceeded: bool,
 }
 
 impl Scheduler {
-    pub fn new(scope: ScopePolicy, work_tx: mpsc::UnboundedSender<WorkItem>) -> Self {
+    pub fn new(
+        scope: ScopePolicy,
+        work_tx: mpsc::UnboundedSender<WorkItem>,
+        max_targets: usize,
+    ) -> Self {
         Self {
             scope,
-            seen_hostnames: Arc::new(Mutex::new(HashSet::new())),
+            state: Arc::new(Mutex::new(SchedulerState::default())),
             work_tx,
+            max_targets,
         }
+    }
+
+    pub fn limit_exceeded(&self) -> bool {
+        self.state.lock().unwrap().limit_exceeded
     }
 
     pub async fn submit_target_with_source(
@@ -74,10 +90,15 @@ impl Scheduler {
         }
 
         {
-            let mut seen = self.seen_hostnames.lock().unwrap();
-            if !seen.insert(norm.clone()) {
+            let mut state = self.state.lock().unwrap();
+            if state.seen_hostnames.contains(&norm) {
                 return false;
             }
+            if state.seen_hostnames.len() >= self.max_targets {
+                state.limit_exceeded = true;
+                return false;
+            }
+            state.seen_hostnames.insert(norm.clone());
         }
 
         self.work_tx
@@ -91,5 +112,23 @@ impl Scheduler {
     pub async fn submit_raw_target(&self, raw_target: &str) -> bool {
         self.submit_target_with_source(raw_target, DiscoverySource::Seed)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn target_limit_rejects_new_hosts_but_allows_duplicates() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new(ScopePolicy::new(vec!["example.com".into()]), tx, 1);
+        assert!(scheduler.submit_raw_target("example.com").await);
+        assert!(!scheduler.submit_raw_target("example.com").await);
+        assert!(!scheduler.limit_exceeded());
+        assert!(!scheduler.submit_raw_target("api.example.com").await);
+        assert!(scheduler.limit_exceeded());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 }

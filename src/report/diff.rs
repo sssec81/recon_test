@@ -164,6 +164,16 @@ pub fn compare_scan_runs(
     scan_id_a: &Uuid,
     scan_id_b: &Uuid,
 ) -> Result<ScanDiffResult, Box<dyn std::error::Error>> {
+    for id in [scan_id_a, scan_id_b] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scan_runs WHERE id = ?1)",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(format!("scan ID {id} does not exist").into());
+        }
+    }
     let obs_a = fetch_scan_http_obs(conn, scan_id_a)?;
     let obs_b = fetch_scan_http_obs(conn, scan_id_b)?;
 
@@ -257,4 +267,22 @@ pub fn compare_scan_runs(
         ip_changes,
         new_technologies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::db::{init_db, save_scan_run};
+    use crate::storage::models::ScanRun;
+
+    #[test]
+    fn rejects_unknown_scan_id() {
+        let conn = init_db(":memory:").unwrap();
+        let run = ScanRun::new(vec!["example.com".into()], "test".into());
+        save_scan_run(&conn, &run).unwrap();
+        let error = compare_scan_runs(&conn, &Uuid::new_v4(), &run.id)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("does not exist"));
+    }
 }

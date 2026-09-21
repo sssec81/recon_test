@@ -27,12 +27,26 @@ pub fn fetch_tls_info(hostname: &str, port: u16) -> Option<TlsCertificateInfo> {
         hostname.to_string()
     };
     let addr_str = format!("{}:{}", host_for_socket, port);
-    let socket_addr = addr_str.to_socket_addrs().ok()?.next()?;
-
-    let stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-
-    let tls_stream = connector.connect(hostname, stream).ok()?;
+    let mut tls_stream = None;
+    for socket_addr in addr_str.to_socket_addrs().ok()? {
+        let Ok(stream) = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3)) else {
+            continue;
+        };
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .is_err()
+            || stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .is_err()
+        {
+            continue;
+        }
+        if let Ok(connected) = connector.connect(hostname, stream) {
+            tls_stream = Some(connected);
+            break;
+        }
+    }
+    let tls_stream = tls_stream?;
     let cert = tls_stream.peer_certificate().ok()??;
     let der = cert.to_der().ok()?;
 

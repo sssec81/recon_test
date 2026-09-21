@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,7 +113,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (work_tx, mut work_rx) = mpsc::unbounded_channel::<WorkItem>();
     let (event_tx, event_rx) = mpsc::channel::<ReconEvent>(10000);
 
-    let scheduler = Scheduler::new(scope_policy, work_tx);
+    let scheduler = Scheduler::new(scope_policy, work_tx, args.max_targets);
 
     // Keep wildcard fingerprints for validating generated DNS candidates.
     let mut wildcard_ips = HashMap::new();
@@ -177,7 +177,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(events::process_events(event_rx, db_tx.clone(), scan_run.id));
 
     // Dispatch work until workers stop adding new targets.
-    let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut set = JoinSet::new();
     let mut inflight = 0usize;
 
@@ -190,9 +189,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tokio::select! {
-            Some(work) = work_rx.recv() => {
+            Some(work) = work_rx.recv(), if inflight < args.concurrency => {
                 inflight += 1;
-                let sem = Arc::clone(&semaphore);
                 let context = worker::WorkerContext {
                     client: probe_client.clone(), resolver: dns_resolver.clone(),
                     strategy: args.scheme_strategy, scan_id: scan_run.id,
@@ -200,10 +198,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     wildcard_ips: Arc::clone(&wildcard_ips),
                 };
 
-                set.spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
-                    worker::probe(work, context).await
-                });
+                set.spawn(worker::probe(work, context));
             }
             Some(result) = set.join_next(), if inflight > 0 => {
                 result??;
@@ -213,6 +208,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let target_limit_exceeded = main_scheduler.limit_exceeded();
     drop(main_scheduler);
 
     // Drop event_tx & work_tx to close processor cleanly
@@ -222,6 +218,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Drop db_tx to flush remaining SQLite records and await writer completion
     drop(db_tx);
     db_writer_handle.await??;
+
+    if target_limit_exceeded {
+        return Err(format!(
+            "Scan exceeded --max-targets {}. Increase the limit to include all discovered hosts.",
+            args.max_targets
+        )
+        .into());
+    }
 
     // Mark the run complete after all observation bundles are written.
     scan_run.complete();
