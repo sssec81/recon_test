@@ -36,7 +36,7 @@ flowchart TD
     G --> I
 ```
 
-Host discovery uses your targets and, by default, certificate records from crt.sh. The scanner probes ports `80`, `443`, `8000`, `8080`, and `8443`. It follows HTTP redirects only within scope. A failed crt.sh request fails the scan; use `--passive false` when you want to skip crt.sh.
+Host discovery uses your targets and, by default, certificate records from crt.sh. The scanner probes ports `80`, `443`, `8000`, `8080`, and `8443`. Target HTTP redirects are followed manually only when every hop remains in scope; each hop is separately rate-limited and budgeted. crt.sh uses bounded retries. If it remains unavailable, the scan continues and records a failed provider status, so passive hostname discovery may be incomplete.
 
 A domain scope includes that domain and its subdomains. An IP scope includes only that IP. With `--file`, set `--scope` to the authorized root domain if you want discoveries across that root; otherwise each file entry becomes a scope root.
 
@@ -81,7 +81,7 @@ The scanner tries the selected scheme even if the port check missed it. Failed w
 | `--triage` | Run bounded evidence triage after recon | `false` |
 | `--triage-max-pages <N>` | Maximum pages or scripts fetched in triage | `250` |
 | `--triage-max-depth <N>` | Maximum crawl depth from discovered endpoints | `2` |
-| `--triage-max-requests <N>` | Total triage request budget, including checks | `1000` |
+| `--triage-max-requests <N>` | Triage crawl and verification request budget, including checks; also contributes to the shared target-HTTP ceiling | `1000` |
 | `--triage-max-minutes <N>` | Triage phase time limit in minutes | `240` |
 | `--triage-max-findings <N>` | Maximum review queue entries | `5` |
 | `--triage-delay-ms <N>` | Delay between triage requests | `200` |
@@ -111,7 +111,7 @@ For Anthropic analysis, set `ANTHROPIC_API_KEY` and add `--llm-backend anthropic
 cargo run --release -- -t example.com --scope example.com --passive false --triage
 ```
 
-Triage starts after recon. Its time and request limits apply to the triage phase only. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, `endpoints.json`, `anomalies.json`, `suppressed.json`, and `evidence/`. The endpoint inventory records route templates, query and form field names, discovery sources, observed statuses, and content types. `suppressed.json` records candidates rejected by repeat or control checks, budget limits, and the review queue cap. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
+Triage starts after recon. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Triage retains its own `--triage-max-requests` crawl/verification limit. In addition, reconnaissance, triage, and verification share a target-HTTP scheduler with scope checks, global and per-host pacing, concurrency limits, deadlines, and a total ceiling of `max-targets × 8 + triage-max-requests` requests. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, `endpoints.json`, `anomalies.json`, `suppressed.json`, and `evidence/`. The endpoint inventory records route templates, query and form field names, discovery sources, observed statuses, and content types. `suppressed.json` records candidates rejected by repeat or control checks, budget limits, and the review queue cap. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
 
 Triage also rechecks initial web endpoints that returned a server error, so a detailed error page at the scan entry point can enter the review queue.
 
@@ -128,13 +128,13 @@ cargo run -- -t example.com --diff-last --llm-analyze
 
 Existing databases remain usable. Older service and TLS rows stay in their legacy tables because they did not contain a scan ID; new observations use scan-specific tables. Re-scan a target to build comparable service and TLS history.
 
-Passive discovery errors now fail the run instead of producing an incomplete successful scan. Use `--passive false` when crt.sh is unavailable.
+`provider_statuses` records crt.sh status per scan, including status, attempts, discovered count, and a sanitized error category. A crt.sh failure does not fail the scan; inspect the completion output or database before treating passive discovery as complete. Use `--passive false` to skip crt.sh entirely.
 
 ## Verification and limitations
 
 Run `cargo test --all-targets` for the local test suite. It uses loopback HTTP servers and an in-memory SQLite database; it does not scan public targets. Run `cargo fmt --check` to check formatting.
 
-This is reconnaissance and review assistance, not a vulnerability verdict. Triage uses GET requests, skips common action paths and sensitive query names, and limits page bytes, time, requests, and review entries. A GET endpoint can still have side effects, so set limits appropriate to the target. Review candidates require manual validation, especially object ownership and authorization. TLS certificate validation is relaxed for target probes to collect metadata from staging or misconfigured endpoints; crt.sh and AI API requests use normal certificate validation. Scan comparison requires two completed runs with comparable scope and settings. Optional AI output is advisory and does not change deterministic triage findings.
+This is reconnaissance and review assistance, not a vulnerability verdict. Triage uses GET requests, skips common action paths and sensitive query names, and limits page bytes, time, requests, and review entries. A GET endpoint can still have side effects, so set limits appropriate to the target. Review candidates require manual validation, especially object ownership and authorization. TLS certificate validation is relaxed for target probes to collect metadata from staging or misconfigured endpoints; crt.sh and AI API requests use normal certificate validation. Scan comparison requires two completed runs with comparable scope and settings. Optional AI output is advisory and does not change deterministic triage findings or initiate target requests.
 
 ## License
 MIT
