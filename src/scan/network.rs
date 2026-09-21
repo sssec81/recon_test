@@ -50,12 +50,21 @@ impl ProbePolicy {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(RequestError::Deadline);
         }
-        let permit = self
-            .concurrency
-            .clone()
-            .acquire_owned()
+        let permit = if let Some(deadline) = self.deadline {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.concurrency.clone().acquire_owned(),
+            )
             .await
-            .map_err(|_| RequestError::Closed)?;
+            .map_err(|_| RequestError::Deadline)?
+            .map_err(|_| RequestError::Closed)?
+        } else {
+            self.concurrency
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| RequestError::Closed)?
+        };
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             drop(permit);
             return Err(RequestError::Deadline);
@@ -188,11 +197,20 @@ impl RequestScheduler {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(RequestError::Deadline.into());
         }
-        let _permit = self
-            .concurrency
-            .acquire()
+        let _permit = if let Some(deadline) = self.deadline {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.concurrency.acquire(),
+            )
             .await
-            .map_err(|_| RequestError::Closed)?;
+            .map_err(|_| RequestError::Deadline)?
+            .map_err(|_| RequestError::Closed)?
+        } else {
+            self.concurrency
+                .acquire()
+                .await
+                .map_err(|_| RequestError::Closed)?
+        };
         self.pace(url).await?;
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(RequestError::Deadline.into());
@@ -279,12 +297,11 @@ mod tests {
             let p = p.clone();
             tokio::spawn(async move { p.acquire("example.com", ProbeKind::Tcp).await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(held);
         assert!(matches!(
             waiting.await.unwrap(),
             Err(RequestError::Deadline)
         ));
+        drop(held);
         assert_eq!(p.accounting.tcp_operations.load(Ordering::SeqCst), 0);
     }
 
@@ -358,13 +375,12 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.get(&url).await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(held);
         let error = waiting.await.unwrap().unwrap_err();
         assert!(matches!(
             error.downcast_ref::<RequestError>(),
             Some(RequestError::Deadline)
         ));
+        drop(held);
         assert_eq!(s.remaining.load(Ordering::SeqCst), 1);
     }
 
