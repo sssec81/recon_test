@@ -6,13 +6,16 @@ mod model;
 mod report;
 
 use crate::cli::Args;
+use crate::scan::network::RequestScheduler;
 use crate::scan::scope::ScopePolicy;
 use crate::storage::models::HttpObservation;
 pub(crate) use crawl::is_safe_url;
 use crawl::{FetchBudget, extract_links};
 use inventory::Inventory;
 use model::{Confidence, Finding, ReviewQueue, SuppressedCandidate};
-use reqwest::{Client, Url};
+#[cfg(test)]
+use reqwest::Client;
+use reqwest::Url;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -68,7 +71,7 @@ impl From<&Args> for TriageConfig {
 }
 
 pub async fn run(
-    client: &Client,
+    client: &RequestScheduler,
     scope: &ScopePolicy,
     observations: &[HttpObservation],
     config: TriageConfig,
@@ -260,6 +263,47 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
+    async fn recon_triage_and_verification_share_one_target_http_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 256];
+                let _ = socket.read(&mut request).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let scheduler = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            1,
+            3,
+            0,
+            0,
+            None,
+        );
+        let url: reqwest::Url = format!("http://{address}/").parse().unwrap();
+        assert!(
+            crate::probes::scanner::probe_single_url(&scheduler, url.as_str())
+                .await
+                .is_some()
+        );
+        let mut triage = FetchBudget::new(&scheduler, &scope, 10, 1, 0);
+        assert!(triage.fetch(&url).await.is_some()); // crawler/triage request
+        assert!(triage.fetch(&url).await.is_some()); // verification/control request path
+        assert!(scheduler.get(&url).await.is_err()); // rejected before a fourth network request
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn triages_server_error_at_scan_entry_point() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -303,10 +347,18 @@ mod tests {
             ),
         ];
         let output_dir = std::env::temp_dir().join(format!("recon_error_test_{scan_id}"));
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            ScopePolicy::new(vec!["127.0.0.1".into()]),
+            4,
+            100,
+            0,
+            0,
+            None,
+        );
         let review = run(
             &client,
             &ScopePolicy::new(vec!["127.0.0.1".into()]),
@@ -415,10 +467,18 @@ mod tests {
             delay_ms: 0,
             output_dir: output_dir.clone(),
         };
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            ScopePolicy::new(vec!["127.0.0.1".into()]),
+            4,
+            100,
+            0,
+            0,
+            None,
+        );
         let review = run(
             &client,
             &ScopePolicy::new(vec!["127.0.0.1".into()]),
@@ -430,7 +490,7 @@ mod tests {
         .unwrap();
         assert_eq!(review.pages_crawled, 8);
         assert_eq!(review.findings.len(), 4);
-        assert_eq!(review.requests_sent, 23);
+        assert_eq!(review.requests_sent, 22);
         assert_eq!(review.response_anomalies, 1);
         assert_eq!(review.duplicates_removed, 1);
         assert_eq!(review.findings_suppressed, 1);

@@ -1,8 +1,9 @@
+use crate::scan::network::RequestScheduler;
 use crate::scan::scope::ScopePolicy;
 use crate::triage::model::{HttpEvidence, Page};
 use futures_util::StreamExt;
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::Url;
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -21,7 +22,7 @@ static JS_CALL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub struct FetchBudget<'a> {
-    client: &'a Client,
+    client: &'a RequestScheduler,
     scope: &'a ScopePolicy,
     deadline: Instant,
     max_requests: usize,
@@ -31,7 +32,7 @@ pub struct FetchBudget<'a> {
 
 impl<'a> FetchBudget<'a> {
     pub fn new(
-        client: &'a Client,
+        client: &'a RequestScheduler,
         scope: &'a ScopePolicy,
         max_requests: usize,
         max_minutes: u64,
@@ -66,7 +67,7 @@ impl<'a> FetchBudget<'a> {
                 return None;
             }
             self.requests += 1;
-            let response = match self.client.get(current.clone()).send().await {
+            let response = match self.client.get(&current).await {
                 Ok(response) => response,
                 Err(error) => {
                     return Some(Page {

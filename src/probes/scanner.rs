@@ -1,4 +1,4 @@
-use reqwest::Client;
+use crate::scan::network::RequestScheduler;
 use std::time::Instant;
 
 #[derive(Debug, Default, Clone)]
@@ -33,11 +33,11 @@ fn extract_title(html: &str) -> Option<String> {
     })
 }
 
-pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> {
+pub async fn probe_single_url(client: &RequestScheduler, url: &str) -> Option<ScanResult> {
     use futures_util::StreamExt;
 
     let start = Instant::now();
-    let response = client.get(url).send().await.ok()?;
+    let response = client.get(&url.parse().ok()?).await.ok()?;
     let rtt_ms = start.elapsed().as_millis() as u64;
 
     let status_code = Some(response.status().as_u16());
@@ -78,7 +78,7 @@ pub async fn probe_single_url(client: &Client, url: &str) -> Option<ScanResult> 
 }
 
 pub async fn probe_subdomain(
-    client: &Client,
+    client: &RequestScheduler,
     subdomain: &str,
     strategy: SchemeStrategy,
 ) -> Vec<(String, ScanResult)> {
@@ -126,6 +126,7 @@ pub async fn probe_subdomain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::Client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -163,10 +164,18 @@ mod tests {
                     .unwrap();
             }
         });
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
+        let client = crate::scan::network::RequestScheduler::new(
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            crate::scan::scope::ScopePolicy::new(vec![host.clone()]),
+            2,
+            10,
+            0,
+            0,
+            None,
+        );
         let results = probe_subdomain(&client, &host, SchemeStrategy::BothParallel).await;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, format!("https://{host}"));

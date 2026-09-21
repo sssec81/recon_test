@@ -1,5 +1,6 @@
 pub mod app;
 pub mod events;
+pub mod network;
 pub mod normalize;
 pub mod pipeline;
 pub mod scope;

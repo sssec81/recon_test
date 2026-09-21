@@ -279,6 +279,7 @@ fn signal_matches(category: &str, page: &Page) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::network::RequestScheduler;
     use crate::scan::scope::ScopePolicy;
     use crate::triage::model::HttpEvidence;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -374,11 +375,19 @@ mod tests {
             baseline_evidence: baseline,
             control_evidence: control,
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
         let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let client = RequestScheduler::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            2,
+            20,
+            0,
+            0,
+            None,
+        );
         let mut budget = FetchBudget::new(&client, &scope, 10, 1, 0);
         let outcome = verify_response_anomaly(&anomaly, &mut budget).await;
         assert!(matches!(
@@ -429,11 +438,19 @@ mod tests {
             &url,
         )
         .remove(0);
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
         let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let client = RequestScheduler::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            2,
+            20,
+            0,
+            0,
+            None,
+        );
         let mut budget = FetchBudget::new(&client, &scope, 10, 1, 0);
         let outcome = verify(&mut finding, &mut budget).await;
         assert!(matches!(outcome, Verification::Rejected(_)));

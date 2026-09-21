@@ -1,8 +1,10 @@
 use crate::cli::{self, Args, LlmBackend};
 use crate::probes::crtsh;
+use crate::probes::crtsh::DiscoveryProvider;
 use crate::probes::dns::AsyncDnsResolver;
 use crate::report::{llm, reporting};
 use crate::scan::events;
+use crate::scan::network::{ProbePolicy, RequestScheduler, ScanContext};
 use crate::scan::pipeline::{ReconEvent, Scheduler, WorkItem};
 use crate::scan::scope::ScopePolicy;
 use crate::scan::worker;
@@ -88,24 +90,44 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let config_hash = format!("{:x}", Sha256::digest(config.as_bytes()));
 
     // Active HTTP redirects must stay within the same scope as the seed targets.
-    let redirect_scope = scope_policy.clone();
     let probe_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 5 {
-                return attempt.stop();
-            }
-            if redirect_scope.allows_redirect_url(attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(10)
         .user_agent("recon_test/1.0.0")
         .danger_accept_invalid_certs(true)
         .build()?;
+    let target_scheduler = RequestScheduler::new(
+        probe_client.clone(),
+        scope_policy.clone(),
+        args.concurrency,
+        args.triage_max_requests
+            .saturating_add(args.max_targets.saturating_mul(8)),
+        20,
+        5,
+        Some(
+            std::time::Instant::now()
+                + Duration::from_secs(args.triage_max_minutes.saturating_mul(60).max(60)),
+        ),
+    );
+    let scan_context = ScanContext {
+        scope: scope_policy.clone(),
+        target_http: Arc::new(target_scheduler.clone()),
+        probes: Arc::new(ProbePolicy::new(
+            scope_policy.clone(),
+            args.concurrency,
+            Some(
+                std::time::Instant::now()
+                    + Duration::from_secs(args.triage_max_minutes.saturating_mul(60).max(60)),
+            ),
+        )),
+        deadline: Some(
+            std::time::Instant::now()
+                + Duration::from_secs(args.triage_max_minutes.saturating_mul(60).max(60)),
+        ),
+    };
+    let _scan_deadline = scan_context.deadline;
     let conn = db::init_db(&args.db)?;
     let (db_tx, db_writer_handle) = db::start_db_writer(args.db.clone());
     println!("✅ Database WAL writer connected to '{}'", args.db);
@@ -151,7 +173,31 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         for root_domain in root_scope.iter().filter(|root| {
             !crate::scan::normalize::NormalizedHostname::new(root).is_some_and(|h| h.is_ip())
         }) {
-            let ct_subdomains = crtsh::query_crtsh(&http_client, root_domain).await?;
+            let provider = crtsh::CrtShProvider;
+            println!("  [{}] querying…", provider.name());
+            let provider_result = provider.discover(&http_client, root_domain).await;
+            let status = provider_result.status;
+            db::save_provider_status(
+                &conn,
+                &scan_run.id,
+                status.provider,
+                status.ok,
+                status.attempts,
+                status.discovered_count,
+                status.error_category,
+            )?;
+            if status.ok {
+                println!(
+                    "  [{}] OK: {} discovery candidate(s) in {} attempt(s)",
+                    status.provider, status.discovered_count, status.attempts
+                );
+            } else {
+                println!(
+                    "  [{}] FAILED after {} attempt(s): {:?}. Passive hostname discovery may be incomplete.",
+                    status.provider, status.attempts, status.error_category
+                );
+            }
+            let ct_subdomains = provider_result.names;
             println!(
                 "  [crt.sh] Discovered {} candidate subdomain(s) for domain '{}'",
                 ct_subdomains.len(),
@@ -192,7 +238,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Some(work) = work_rx.recv(), if inflight < args.concurrency => {
                 inflight += 1;
                 let context = worker::WorkerContext {
-                    client: probe_client.clone(), resolver: dns_resolver.clone(),
+                    client: (*scan_context.target_http).clone(), probes: (*scan_context.probes).clone(), resolver: dns_resolver.clone(),
                     strategy: args.scheme_strategy, scan_id: scan_run.id,
                     bus: event_tx.clone(), scheduler: main_scheduler.clone(),
                     wildcard_ips: Arc::clone(&wildcard_ips),
@@ -235,18 +281,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.triage {
         let observations = db::get_scan_observations(&conn, &scan_run.id)?;
-        let scope = ScopePolicy::new(root_scope);
-        let triage_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(10)
-            .user_agent("recon_test/1.0.0")
-            .danger_accept_invalid_certs(true)
-            .build()?;
         let review = triage::run(
-            &triage_client,
-            &scope,
+            scan_context.target_http.as_ref(),
+            &scan_context.scope,
             &observations,
             TriageConfig::from(&args),
             scan_run.id,

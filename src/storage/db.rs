@@ -26,6 +26,19 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS provider_statuses (
+            scan_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            discovered_count INTEGER NOT NULL,
+            error_category TEXT,
+            PRIMARY KEY(scan_id, provider),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        )",
+        [],
+    )?;
 
     // 2. Hostnames table
     conn.execute(
@@ -159,6 +172,22 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
     )?;
 
     Ok(conn)
+}
+
+pub fn save_provider_status(
+    conn: &Connection,
+    scan_id: &Uuid,
+    provider: &str,
+    ok: bool,
+    attempts: u8,
+    discovered_count: usize,
+    error_category: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO provider_statuses (scan_id, provider, status, attempts, discovered_count, error_category) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![scan_id.to_string(), provider, if ok { "OK" } else { "FAILED" }, attempts, discovered_count as i64, error_category],
+    )?;
+    Ok(())
 }
 
 pub fn save_scan_run(conn: &Connection, scan_run: &ScanRun) -> Result<()> {
@@ -600,5 +629,60 @@ mod tests {
         .unwrap();
         drop(tx);
         assert!(handle.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn provider_status_schema_and_scan_association_are_created_non_destructively() {
+        let conn = init_db(":memory:").unwrap();
+        let run = ScanRun::new(vec!["example.com".into()], "test".into());
+        save_scan_run(&conn, &run).unwrap();
+        save_provider_status(&conn, &run.id, "crt.sh", true, 2, 3, None).unwrap();
+        let row: (String, String, i64, i64) = conn.query_row(
+            "SELECT status, scan_id, attempts, discovered_count FROM provider_statuses WHERE provider='crt.sh'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(row.0, "OK");
+        assert_eq!(row.1, run.id.to_string());
+        assert_eq!((row.2, row.3), (2, 3));
+    }
+
+    #[test]
+    fn existing_database_is_upgraded_without_losing_scan_rows() {
+        let path = std::env::temp_dir().join(format!("recon_pre_phase1_{}.db", Uuid::new_v4()));
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute("CREATE TABLE scan_runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, root_scope TEXT NOT NULL, config_hash TEXT NOT NULL)", []).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO scan_runs VALUES ('legacy', 'now', NULL, 'example.com', 'hash')",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+        let conn = init_db(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM scan_runs WHERE id='legacy'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.query_row("SELECT count(*) FROM provider_statuses", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_statuses VALUES ('legacy','crt.sh','OK',1,1,NULL)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT scan_id FROM provider_statuses", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "legacy"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

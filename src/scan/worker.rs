@@ -1,6 +1,7 @@
 use crate::probes::dns::AsyncDnsResolver;
 use crate::probes::fingerprint;
 use crate::probes::{scanner, services, tls};
+use crate::scan::network::{ProbeKind, ProbePolicy, RequestScheduler};
 use crate::scan::pipeline::{ReconEvent, Scheduler, WorkItem};
 use crate::storage::models::{
     DiscoverySource, HttpObservation, ServiceRecord, TechnologyObservation, TlsRecord,
@@ -13,7 +14,8 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct WorkerContext {
-    pub client: reqwest::Client,
+    pub client: RequestScheduler,
+    pub probes: ProbePolicy,
     pub resolver: AsyncDnsResolver,
     pub strategy: SchemeStrategy,
     pub scan_id: Uuid,
@@ -25,6 +27,7 @@ pub struct WorkerContext {
 pub async fn probe(work: WorkItem, context: WorkerContext) -> Result<(), String> {
     let WorkerContext {
         client,
+        probes,
         resolver,
         strategy,
         scan_id,
@@ -35,7 +38,12 @@ pub async fn probe(work: WorkItem, context: WorkerContext) -> Result<(), String>
     let WorkItem::ProbeTarget { hostname, source } = work;
     let name = hostname.as_str().to_string();
     let host = hostname.as_url_host();
+    let _dns_permit = probes
+        .acquire(&name, ProbeKind::Dns)
+        .await
+        .map_err(|e| e.to_string())?;
     let records = resolver.resolve_all(scan_id, &name).await;
+    drop(_dns_permit);
     if source == DiscoverySource::DnsBruteforce
         && is_wildcard_candidate(&name, &records, &wildcard_ips)
     {
@@ -55,7 +63,12 @@ pub async fn probe(work: WorkItem, context: WorkerContext) -> Result<(), String>
     .await
     .map_err(|_| "event channel closed".to_string())?;
 
+    let _tcp_permit = probes
+        .acquire(&name, ProbeKind::Tcp)
+        .await
+        .map_err(|e| e.to_string())?;
     let open_ports = services::probe_open_ports(&host, services::DEFAULT_PORTS).await;
+    drop(_tcp_permit);
     let service_records = open_ports
         .iter()
         .map(|&port| ServiceRecord::new(scan_id, name.clone(), port, "tcp".to_string(), true))
@@ -72,10 +85,15 @@ pub async fn probe(work: WorkItem, context: WorkerContext) -> Result<(), String>
         .copied()
         .filter(|p| matches!(p, 443 | 8443))
     {
+        let _tls_permit = probes
+            .acquire(&name, ProbeKind::Tls)
+            .await
+            .map_err(|e| e.to_string())?;
         let tls_host = name.clone();
         let tls_info = tokio::task::spawn_blocking(move || tls::fetch_tls_info(&tls_host, port))
             .await
             .map_err(|e| e.to_string())?;
+        drop(_tls_permit);
         if let Some(info) = tls_info {
             for san in &info.san_domains {
                 scheduler
@@ -147,7 +165,7 @@ fn endpoint_candidates(host: &str, open_ports: &[u16], strategy: SchemeStrategy)
 }
 
 async fn probe_endpoint(
-    client: &reqwest::Client,
+    client: &RequestScheduler,
     endpoint: &str,
     strategy: SchemeStrategy,
 ) -> (String, scanner::ScanResult) {
