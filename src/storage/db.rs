@@ -47,12 +47,33 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         );
         CREATE TABLE IF NOT EXISTS endpoint_observations (
             endpoint_id TEXT NOT NULL, scan_id TEXT NOT NULL, raw_url TEXT NOT NULL,
-            source TEXT NOT NULL, source_reference TEXT,
-            PRIMARY KEY(endpoint_id, scan_id, raw_url, source),
+            source TEXT NOT NULL, source_reference TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(endpoint_id, scan_id, raw_url, source, source_reference),
             FOREIGN KEY(endpoint_id) REFERENCES endpoints(id),
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
         );",
     )?;
+    let observation_reference_is_key = conn
+        .prepare("PRAGMA table_info(endpoint_observations)")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|(name, key_order)| name == "source_reference" && *key_order > 0);
+    if !observation_reference_is_key {
+        conn.execute_batch(
+            "ALTER TABLE endpoint_observations RENAME TO endpoint_observations_legacy;
+             CREATE TABLE endpoint_observations (
+                endpoint_id TEXT NOT NULL, scan_id TEXT NOT NULL, raw_url TEXT NOT NULL,
+                source TEXT NOT NULL, source_reference TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(endpoint_id, scan_id, raw_url, source, source_reference),
+                FOREIGN KEY(endpoint_id) REFERENCES endpoints(id), FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+             );
+             INSERT OR IGNORE INTO endpoint_observations SELECT endpoint_id, scan_id, raw_url, source, COALESCE(source_reference, '') FROM endpoint_observations_legacy;
+             DROP TABLE endpoint_observations_legacy;",
+        )?;
+    }
 
     // 2. Hostnames table
     conn.execute(
@@ -204,7 +225,6 @@ pub fn save_provider_status(
     Ok(())
 }
 
-#[cfg(test)]
 pub fn save_endpoint_observation(
     conn: &Connection,
     scan_id: &Uuid,
@@ -217,7 +237,7 @@ pub fn save_endpoint_observation(
     };
     let id = crate::scan::normalize::endpoint_id(&endpoint);
     conn.execute("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan", params![id, endpoint.scheme, endpoint.host, endpoint.port, endpoint.path, endpoint.canonical_url, scan_id.to_string()])?;
-    conn.execute("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)", params![crate::scan::normalize::endpoint_id(&endpoint), scan_id.to_string(), raw_url, source, source_reference])?;
+    conn.execute("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)", params![crate::scan::normalize::endpoint_id(&endpoint), scan_id.to_string(), raw_url, source, source_reference.unwrap_or("")])?;
     Ok(())
 }
 
@@ -426,7 +446,7 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                         bundle.scan_id.to_string(),
                         http.url,
                         "http_probe",
-                        Option::<String>::None
+                        ""
                     ])?;
                 }
             }
@@ -757,6 +777,14 @@ mod tests {
             &run.id,
             "https://api.example.com/api/users?id=2",
             "javascript",
+            Some("admin.js"),
+        )
+        .unwrap();
+        save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://api.example.com/api/users?id=2",
+            "javascript",
             Some("app.js"),
         )
         .unwrap();
@@ -769,7 +797,7 @@ mod tests {
             conn.query_row("SELECT count(*) FROM endpoint_observations", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 }

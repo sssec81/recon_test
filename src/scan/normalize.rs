@@ -174,4 +174,33 @@ mod tests {
         assert_eq!(first.canonical_url, second.canonical_url);
         assert!(normalize_endpoint("mailto:test@example.com", None).is_none());
     }
+
+    #[test]
+    fn canonical_endpoint_handles_relative_hosts_ports_and_ip_literals() {
+        let base: reqwest::Url = "https://Example.com/root/".parse().unwrap();
+        assert_eq!(
+            normalize_endpoint("../api", Some(&base))
+                .unwrap()
+                .canonical_url,
+            "https://example.com/api"
+        );
+        assert_eq!(
+            normalize_endpoint("https://example.com.:8443/a", None)
+                .unwrap()
+                .canonical_url,
+            "https://example.com:8443/a"
+        );
+        assert_eq!(
+            normalize_endpoint("http://[2001:db8::1]/v1", None)
+                .unwrap()
+                .canonical_url,
+            "http://[2001:db8::1]/v1"
+        );
+        assert_eq!(
+            normalize_endpoint("http://192.0.2.1/x?b=2&a=1", None)
+                .unwrap()
+                .canonical_url,
+            "http://192.0.2.1/x"
+        );
+    }
 }
