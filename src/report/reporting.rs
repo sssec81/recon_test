@@ -12,6 +12,11 @@ pub async fn report(
     http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scan_id = scan_run.id;
+    // Idempotently retain canonical endpoint provenance for any observations written by
+    // older databases or alternate ingestion paths.
+    for observation in db::get_scan_observations(conn, &scan_id)? {
+        db::save_endpoint_observation(conn, &scan_id, &observation.url, "http_probe", None)?;
+    }
     // Export observations when requested.
     if args.export_json.is_some() || args.export_csv.is_some() {
         let scan_observations = db::get_scan_observations(conn, &scan_id)?;
