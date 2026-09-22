@@ -2,6 +2,7 @@ use crate::cli::{self, Args, LlmBackend};
 use crate::probes::crtsh;
 use crate::probes::crtsh::DiscoveryProvider;
 use crate::probes::dns::AsyncDnsResolver;
+use crate::probes::historical::{CommonCrawlProvider, WaybackProvider, in_scope_historical_urls};
 use crate::report::{llm, reporting};
 use crate::scan::events;
 use crate::scan::network::{ProbePolicy, RequestScheduler, ScanContext};
@@ -167,9 +168,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Add passive Certificate Transparency discoveries.
+    // Passive provider responses only enrich inventory.  They never enqueue an
+    // active target request; any later active use remains scheduler-controlled.
     if args.passive {
-        println!("📜 Ingesting passive Certificate Transparency logs (crt.sh)...");
+        println!("📜 Ingesting passive discovery providers...");
         for root_domain in root_scope.iter().filter(|root| {
             !crate::scan::normalize::NormalizedHostname::new(root).is_some_and(|h| h.is_ip())
         }) {
@@ -209,6 +211,48 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 {
                     queued_count += 1;
+                }
+            }
+
+            let wayback = WaybackProvider::default();
+            let common_crawl = CommonCrawlProvider::default();
+            for provider in [
+                &wayback as &dyn DiscoveryProvider,
+                &common_crawl as &dyn DiscoveryProvider,
+            ] {
+                println!("  [{}] querying passive URL history…", provider.name());
+                let result = provider.discover(&http_client, root_domain).await;
+                let status = result.status;
+                db::save_provider_status(
+                    &conn,
+                    &scan_run.id,
+                    status.provider,
+                    status.ok,
+                    status.attempts,
+                    status.discovered_count,
+                    status.error_category,
+                )?;
+                if status.ok {
+                    let mut accepted = 0usize;
+                    for raw_url in in_scope_historical_urls(&scan_context.scope, result.urls) {
+                        db::save_endpoint_observation(
+                            &conn,
+                            &scan_run.id,
+                            &raw_url,
+                            status.provider,
+                            Some(root_domain),
+                        )?;
+                        accepted += 1;
+                    }
+                    println!(
+                        "  [{}] OK: {} in-scope historical URL observation(s) retained ({} returned)",
+                        status.provider, accepted, status.discovered_count
+                    );
+                } else {
+                    println!(
+                        "  [{}] FAILED after {} attempt(s): {:?}. Passive URL discovery may be incomplete.",
+                        status.provider, status.attempts, status.error_category
+                    );
                 }
             }
         }

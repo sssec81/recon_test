@@ -19,6 +19,9 @@ pub struct ProviderStatus {
 
 pub struct DiscoveryResult {
     pub names: Vec<String>,
+    /// Passive URL observations. They are inventory evidence only and must never
+    /// be scheduled for active target requests by a provider.
+    pub urls: Vec<String>,
     pub status: ProviderStatus,
 }
 
@@ -78,6 +81,7 @@ pub async fn query_crtsh_at(client: &Client, endpoint: &str, domain: &str) -> Di
                         let count = names.len();
                         return DiscoveryResult {
                             names,
+                            urls: Vec::new(),
                             status: ProviderStatus {
                                 provider: "crt.sh",
                                 ok: true,
@@ -106,6 +110,7 @@ pub async fn query_crtsh_at(client: &Client, endpoint: &str, domain: &str) -> Di
     };
     DiscoveryResult {
         names: Vec::new(),
+        urls: Vec::new(),
         status: ProviderStatus {
             provider: "crt.sh",
             ok: false,
