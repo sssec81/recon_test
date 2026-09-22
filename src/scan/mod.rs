@@ -1,4 +1,5 @@
 pub mod app;
+pub mod classify;
 pub mod events;
 pub mod fingerprint;
 pub mod javascript;

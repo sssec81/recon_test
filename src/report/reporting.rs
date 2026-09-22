@@ -18,6 +18,7 @@ pub async fn report(
     for observation in db::get_scan_observations(conn, &scan_id)? {
         db::save_endpoint_observation(conn, &scan_id, &observation.url, "http_probe", None)?;
     }
+    db::classify_scan_inventory(conn, &scan_id)?;
     // Export observations when requested.
     if args.export_json.is_some() || args.export_csv.is_some() {
         let scan_observations = db::get_scan_observations(conn, &scan_id)?;

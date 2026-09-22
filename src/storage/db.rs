@@ -206,6 +206,18 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         )",
         [],
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS endpoint_classifications (
+            scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, class TEXT NOT NULL,
+            PRIMARY KEY(scan_id, endpoint_id, class),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
+        CREATE TABLE IF NOT EXISTS parameter_semantics (
+            scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, parameter_name TEXT NOT NULL,
+            semantic TEXT NOT NULL, PRIMARY KEY(scan_id, endpoint_id, parameter_name),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );",
+    )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS hostname_discoveries (
@@ -297,6 +309,50 @@ pub fn save_source_map_observation(
         "INSERT OR IGNORE INTO source_map_observations (scan_id, script_url, map_url, source_file) VALUES (?1, ?2, ?3, ?4)",
         params![scan_id.to_string(), script_url, map_url, source_file],
     )?;
+    Ok(())
+}
+
+/// Rebuilds scan-scoped, deterministic labels from all retained endpoint
+/// observations. This operates solely on the local inventory database.
+pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> {
+    let mut endpoints = conn.prepare(
+        "SELECT e.id, e.canonical_url FROM endpoints e JOIN endpoint_observations o ON o.endpoint_id=e.id WHERE o.scan_id=?1 GROUP BY e.id, e.canonical_url",
+    )?;
+    let rows = endpoints
+        .query_map(params![scan_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    for (endpoint_id, canonical_url) in rows {
+        let raw_urls = {
+            let mut statement = conn.prepare(
+                "SELECT raw_url FROM endpoint_observations WHERE scan_id=?1 AND endpoint_id=?2",
+            )?;
+            statement
+                .query_map(params![scan_id.to_string(), endpoint_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>>>()?
+        };
+        for class in crate::scan::classify::endpoint_classes(&canonical_url, &raw_urls) {
+            conn.execute(
+                "INSERT OR IGNORE INTO endpoint_classifications (scan_id, endpoint_id, class) VALUES (?1, ?2, ?3)",
+                params![scan_id.to_string(), endpoint_id, class],
+            )?;
+        }
+        let mut parameters = std::collections::BTreeSet::new();
+        for raw_url in raw_urls {
+            if let Ok(url) = reqwest::Url::parse(&raw_url) {
+                parameters.extend(url.query_pairs().map(|(name, _)| name.into_owned()));
+            }
+        }
+        for name in parameters {
+            conn.execute(
+                "INSERT OR REPLACE INTO parameter_semantics (scan_id, endpoint_id, parameter_name, semantic) VALUES (?1, ?2, ?3, ?4)",
+                params![scan_id.to_string(), endpoint_id, name, crate::scan::classify::parameter_semantic(&name)],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -953,6 +1009,41 @@ mod tests {
             )
             .unwrap(),
             "https://example.com/assets/app.js"
+        );
+    }
+
+    #[test]
+    fn inventory_classification_is_multi_tagged_and_scan_scoped() {
+        let conn = init_db(":memory:").unwrap();
+        let run = ScanRun::new(vec!["example.com".into()], "classify".into());
+        save_scan_run(&conn, &run).unwrap();
+        save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://example.com/api/users/123?redirect=/home&account_id=7",
+            "historical",
+            Some("wayback"),
+        )
+        .unwrap();
+        classify_scan_inventory(&conn, &run.id).unwrap();
+        let classes = conn
+            .prepare("SELECT class FROM endpoint_classifications WHERE scan_id=?1 ORDER BY class")
+            .unwrap()
+            .query_map(params![run.id.to_string()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(classes.contains(&"Api".into()));
+        assert!(classes.contains(&"UserProfile".into()));
+        assert!(classes.contains(&"Redirect".into()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT semantic FROM parameter_semantics WHERE scan_id=?1 AND parameter_name='redirect'",
+                params![run.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Redirect"
         );
     }
 
