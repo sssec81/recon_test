@@ -14,18 +14,6 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;",
     )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS response_fingerprints (
-        http_observation_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT,
-        status INTEGER NOT NULL, body_length INTEGER NOT NULL, captured_length INTEGER NOT NULL,
-        body_complete BOOLEAN NOT NULL, raw_hash TEXT NOT NULL, normalized_hash TEXT NOT NULL,
-        content_type TEXT, header_hash TEXT NOT NULL, redirect_target TEXT, json_shape_hash TEXT,
-        timing_bucket TEXT NOT NULL, FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
-        FOREIGN KEY(endpoint_id) REFERENCES endpoints(id),
-        FOREIGN KEY(http_observation_id) REFERENCES http_observations(id))",
-        [],
-    )?;
-
     // 1. Scan Runs table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS scan_runs (
@@ -189,6 +177,17 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
             FOREIGN KEY(hostname) REFERENCES hostnames(name)
         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS response_fingerprints (
+        http_observation_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT,
+        status INTEGER NOT NULL, body_length INTEGER NOT NULL, captured_length INTEGER NOT NULL,
+        body_complete BOOLEAN NOT NULL, raw_hash TEXT NOT NULL, normalized_hash TEXT NOT NULL,
+        content_type TEXT, header_hash TEXT NOT NULL, redirect_target TEXT, json_shape_hash TEXT,
+        timing_bucket TEXT NOT NULL, FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+        FOREIGN KEY(endpoint_id) REFERENCES endpoints(id),
+        FOREIGN KEY(http_observation_id) REFERENCES http_observations(id))",
         [],
     )?;
 
