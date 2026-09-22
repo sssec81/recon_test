@@ -157,8 +157,7 @@ pub async fn run(
                     )?;
                 }
                 for source in map.source_contents {
-                    for candidate in crate::scan::javascript::extract(&source, &response_url, scope)
-                    {
+                    for candidate in crate::scan::javascript::extract(&source, &map_url, scope) {
                         db::save_javascript_observation(
                             conn,
                             &scan_id,
@@ -460,12 +459,12 @@ mod tests {
                         "/app.js" => (
                             "200 OK",
                             "application/javascript",
-                            "fetch('/api/items?id=2'); axios.post('/api/search', {query: 'x'});",
+                            "fetch('/api/items?id=2'); axios.post('/api/search', {query: 'x'}); //# sourceMappingURL=/maps/app.js.map",
                         ),
-                        "/app.js.map" => (
+                        "/maps/app.js.map" => (
                             "200 OK",
                             "application/json",
-                            "{\"sources\":[\"src/routes/orders.ts\"],\"sourcesContent\":[\"fetch('/api/orders?accountId=1')\"]}",
+                            "{\"sources\":[\"src/routes/orders.ts\"],\"sourcesContent\":[\"fetch('./api/users')\"]}",
                         ),
                         "/api/items?id=1" => ("200 OK", "application/json", "{\"item\":1}"),
                         "/api/items?id=3" => ("200 OK", "application/json", "{\"item\":3}"),
@@ -564,6 +563,15 @@ mod tests {
             )
             .unwrap(),
             "source_map"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT raw_url FROM endpoint_observations WHERE source='source_map'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .contains("/maps/api/users")
         );
         assert_eq!(review.response_anomalies, 1);
         assert_eq!(review.duplicates_removed, 1);
