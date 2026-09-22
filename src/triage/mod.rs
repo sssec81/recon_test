@@ -8,9 +8,10 @@ mod report;
 use crate::cli::Args;
 use crate::scan::network::RequestScheduler;
 use crate::scan::scope::ScopePolicy;
+use crate::storage::db;
 use crate::storage::models::HttpObservation;
 pub(crate) use crawl::is_safe_url;
-use crawl::{FetchBudget, extract_links};
+use crawl::{FetchBudget, extract_links, script_text};
 use inventory::Inventory;
 use model::{Confidence, Finding, ReviewQueue, SuppressedCandidate};
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub async fn run(
     observations: &[HttpObservation],
     config: TriageConfig,
     scan_id: Uuid,
+    conn: Option<&rusqlite::Connection>,
 ) -> Result<ReviewQueue, Box<dyn std::error::Error>> {
     let mut budget = FetchBudget::new(
         client,
@@ -123,6 +125,13 @@ pub async fn run(
             .as_deref()
             .and_then(|value| Url::parse(value).ok())
             .unwrap_or_else(|| url.clone());
+        if let Some(conn) = conn
+            && let Some(script) = script_text(&page)
+        {
+            for candidate in crate::scan::javascript::extract(&script, &response_url, scope) {
+                db::save_javascript_observation(conn, &scan_id, response_url.as_str(), &candidate)?;
+            }
+        }
         inventory.record_page(&response_url, &page, scope);
         for finding in detect::detect(&page, &response_url) {
             if !seen_candidates.insert(finding.id.clone()) {
@@ -373,6 +382,7 @@ mod tests {
                 output_dir: output_dir.clone(),
             },
             scan_id,
+            None,
         )
         .await
         .unwrap();
@@ -485,6 +495,7 @@ mod tests {
             &observations,
             config,
             scan_id,
+            None,
         )
         .await
         .unwrap();

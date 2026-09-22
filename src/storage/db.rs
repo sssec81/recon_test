@@ -190,6 +190,14 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         FOREIGN KEY(http_observation_id) REFERENCES http_observations(id))",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS javascript_observations (
+            scan_id TEXT NOT NULL, source_url TEXT NOT NULL, kind TEXT NOT NULL,
+            raw_value TEXT NOT NULL, resolved_url TEXT, PRIMARY KEY(scan_id, source_url, kind, raw_value),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        )",
+        [],
+    )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS hostname_discoveries (
@@ -248,6 +256,24 @@ pub fn save_endpoint_observation(
     let id = crate::scan::normalize::endpoint_id(&endpoint);
     conn.execute("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan", params![id, endpoint.scheme, endpoint.host, endpoint.port, endpoint.path, endpoint.canonical_url, scan_id.to_string()])?;
     conn.execute("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)", params![crate::scan::normalize::endpoint_id(&endpoint), scan_id.to_string(), raw_url, source, source_reference.unwrap_or("")])?;
+    Ok(())
+}
+
+pub fn save_javascript_observation(
+    conn: &Connection,
+    scan_id: &Uuid,
+    source_url: &str,
+    candidate: &crate::scan::javascript::JavaScriptCandidate,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO javascript_observations (scan_id, source_url, kind, raw_value, resolved_url) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![scan_id.to_string(), source_url, candidate.kind, candidate.raw_value, candidate.resolved_url],
+    )?;
+    if let Some(url) = &candidate.resolved_url
+        && matches!(candidate.kind, "http_call" | "url_literal")
+    {
+        save_endpoint_observation(conn, scan_id, url, "javascript", Some(source_url))?;
+    }
     Ok(())
 }
 
@@ -869,6 +895,40 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn javascript_evidence_preserves_source_and_does_not_require_activation() {
+        let conn = init_db(":memory:").unwrap();
+        let run = ScanRun::new(vec!["example.com".into()], "javascript".into());
+        save_scan_run(&conn, &run).unwrap();
+        let candidate = crate::scan::javascript::JavaScriptCandidate {
+            kind: "http_call",
+            raw_value: "/api/users?id=1".into(),
+            resolved_url: Some("https://example.com/api/users?id=1".into()),
+        };
+        save_javascript_observation(
+            &conn,
+            &run.id,
+            "https://example.com/assets/app.js",
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM javascript_observations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_reference FROM endpoint_observations WHERE source='javascript'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "https://example.com/assets/app.js"
         );
     }
 

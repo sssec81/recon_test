@@ -331,6 +331,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             &observations,
             TriageConfig::from(&args),
             scan_run.id,
+            Some(&conn),
         )
         .await?;
         if args.llm_analyze {

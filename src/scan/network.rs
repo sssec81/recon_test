@@ -583,22 +583,26 @@ mod tests {
         let a = active.clone();
         let m = max.clone();
         let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
             for _ in 0..4 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let a = a.clone();
                 let m = m.clone();
-                tokio::spawn(async move {
+                handlers.spawn(async move {
                     let now = a.fetch_add(1, Ordering::SeqCst) + 1;
                     m.fetch_max(now, Ordering::SeqCst);
                     let mut b = [0; 128];
                     let _ = socket.read(&mut b).await;
                     tokio::time::sleep(Duration::from_millis(30)).await;
                     let _ = socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
                         .await;
                     a.fetch_sub(1, Ordering::SeqCst);
                 });
             }
+            while handlers.join_next().await.is_some() {}
         });
         let s = Arc::new(RequestScheduler::new(
             Client::builder().build().unwrap(),

@@ -1,6 +1,7 @@
 pub mod app;
 pub mod events;
 pub mod fingerprint;
+pub mod javascript;
 pub mod network;
 pub mod normalize;
 pub mod pipeline;
