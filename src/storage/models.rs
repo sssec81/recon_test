@@ -1,3 +1,4 @@
+use crate::scan::fingerprint::ResponseFingerprint;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -211,6 +212,7 @@ pub struct HttpObservation {
     pub rtt_ms: Option<u64>,
     pub content_length: Option<usize>,
     pub observed_at: DateTime<Utc>,
+    pub fingerprint: Option<ResponseFingerprint>,
 }
 
 impl HttpObservation {
@@ -226,6 +228,7 @@ impl HttpObservation {
             rtt_ms: None,
             content_length: None,
             observed_at: Utc::now(),
+            fingerprint: None,
         }
     }
 

@@ -14,6 +14,17 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;",
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS response_fingerprints (
+        http_observation_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT,
+        status INTEGER NOT NULL, body_length INTEGER NOT NULL, captured_length INTEGER NOT NULL,
+        body_complete BOOLEAN NOT NULL, raw_hash TEXT NOT NULL, normalized_hash TEXT NOT NULL,
+        content_type TEXT, header_hash TEXT NOT NULL, redirect_target TEXT, json_shape_hash TEXT,
+        timing_bucket TEXT NOT NULL, FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+        FOREIGN KEY(endpoint_id) REFERENCES endpoints(id),
+        FOREIGN KEY(http_observation_id) REFERENCES http_observations(id))",
+        [],
+    )?;
 
     // 1. Scan Runs table
     conn.execute(
@@ -241,6 +252,47 @@ pub fn save_endpoint_observation(
     Ok(())
 }
 
+pub fn load_response_fingerprints(
+    conn: &Connection,
+    scan_id: &Uuid,
+    endpoint_id: Option<&str>,
+) -> Result<Vec<crate::scan::fingerprint::ResponseFingerprint>> {
+    let sql = if endpoint_id.is_some() {
+        "SELECT status, body_length, captured_length, body_complete, raw_hash, normalized_hash, content_type, header_hash, redirect_target, json_shape_hash, timing_bucket FROM response_fingerprints WHERE scan_id=?1 AND endpoint_id=?2"
+    } else {
+        "SELECT status, body_length, captured_length, body_complete, raw_hash, normalized_hash, content_type, header_hash, redirect_target, json_shape_hash, timing_bucket FROM response_fingerprints WHERE scan_id=?1"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(endpoint_id) = endpoint_id {
+        stmt.query_map(
+            params![scan_id.to_string(), endpoint_id],
+            fingerprint_from_row,
+        )?
+    } else {
+        stmt.query_map(params![scan_id.to_string()], fingerprint_from_row)?
+    };
+    rows.collect()
+}
+
+fn fingerprint_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::scan::fingerprint::ResponseFingerprint> {
+    Ok(crate::scan::fingerprint::ResponseFingerprint {
+        status: row.get::<_, i64>(0)? as u16,
+        body_length: row.get::<_, i64>(1)? as usize,
+        captured_length: row.get::<_, i64>(2)? as usize,
+        body_complete: row.get(3)?,
+        raw_hash: row.get(4)?,
+        normalized_hash: row.get(5)?,
+        content_type: row.get(6)?,
+        header_hash: row.get(7)?,
+        redirect_target: row.get(8)?,
+        json_shape_hash: row.get(9)?,
+        timing_bucket: serde_json::from_str(&row.get::<_, String>(10)?)
+            .unwrap_or(crate::scan::fingerprint::TimingBucket::Unknown),
+    })
+}
+
 pub fn save_scan_run(conn: &Connection, scan_run: &ScanRun) -> Result<()> {
     let root_scope_str = serde_json::to_string(&scan_run.root_scope).unwrap_or_default();
     conn.execute(
@@ -343,6 +395,7 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
         )?;
         let mut stmt_endpoint = tx.prepare("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan")?;
         let mut stmt_endpoint_observation = tx.prepare("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+        let mut stmt_fingerprint = tx.prepare("INSERT OR REPLACE INTO response_fingerprints (http_observation_id, scan_id, endpoint_id, status, body_length, captured_length, body_complete, raw_hash, normalized_hash, content_type, header_hash, redirect_target, json_shape_hash, timing_bucket) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)")?;
 
         for bundle in bundles {
             // Save Hostname
@@ -448,6 +501,24 @@ pub fn insert_bundle_batch(conn: &mut Connection, bundles: &[ObservationBundle])
                         "http_probe",
                         ""
                     ])?;
+                    if let Some(fingerprint) = &http.fingerprint {
+                        stmt_fingerprint.execute(params![
+                            http.id.to_string(),
+                            http.scan_id.to_string(),
+                            crate::scan::normalize::endpoint_id(&endpoint),
+                            fingerprint.status,
+                            fingerprint.body_length as i64,
+                            fingerprint.captured_length as i64,
+                            fingerprint.body_complete,
+                            fingerprint.raw_hash,
+                            fingerprint.normalized_hash,
+                            fingerprint.content_type,
+                            fingerprint.header_hash,
+                            fingerprint.redirect_target,
+                            fingerprint.json_shape_hash,
+                            serde_json::to_string(&fingerprint.timing_bucket).unwrap_or_default()
+                        ])?;
+                    }
                 }
             }
         }
@@ -515,6 +586,7 @@ pub fn get_scan_observations(conn: &Connection, scan_id: &Uuid) -> Result<Vec<Ht
             observed_at: chrono::DateTime::parse_from_rfc3339(&obs_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
+            fingerprint: None,
         })
     })?;
 
@@ -799,5 +871,140 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn fingerprint_history_is_scan_and_endpoint_scoped() {
+        let conn = init_db(":memory:").unwrap();
+        let a = ScanRun::new(vec!["example.com".into()], "a".into());
+        let b = ScanRun::new(vec!["example.com".into()], "b".into());
+        save_scan_run(&conn, &a).unwrap();
+        save_scan_run(&conn, &b).unwrap();
+        conn.execute(
+            "INSERT INTO hostnames VALUES ('example.com','example.com','Seed',NULL)",
+            [],
+        )
+        .unwrap();
+        for (scan, observation, hash) in [(&a, "oa", "ha"), (&b, "ob", "hb")] {
+            conn.execute("INSERT INTO endpoints VALUES ('ep','https','example.com',NULL,'/','https://example.com/',?1,?1) ON CONFLICT(id) DO NOTHING", params![scan.id.to_string()]).unwrap();
+            conn.execute("INSERT INTO http_observations VALUES (?1,?2,'example.com','https://example.com/',200,NULL,NULL,NULL,NULL,'now')", params![observation, scan.id.to_string()]).unwrap();
+            conn.execute("INSERT INTO response_fingerprints VALUES (?1,?2,'ep',200,1,1,1,?3,?3,NULL,'h',NULL,NULL,'\"very_fast\"')", params![observation, scan.id.to_string(), hash]).unwrap();
+        }
+        assert_eq!(
+            load_response_fingerprints(&conn, &a.id, Some("ep")).unwrap()[0].raw_hash,
+            "ha"
+        );
+        assert_eq!(
+            load_response_fingerprints(&conn, &b.id, None).unwrap()[0].raw_hash,
+            "hb"
+        );
+        assert!(
+            load_response_fingerprints(&conn, &Uuid::new_v4(), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn phase2a_database_upgrades_without_losing_provenance_or_provider_data() {
+        let path = std::env::temp_dir().join(format!("recon_phase2a_{}.db", Uuid::new_v4()));
+        let scan_id = Uuid::new_v4();
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch("CREATE TABLE scan_runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, root_scope TEXT NOT NULL, config_hash TEXT NOT NULL);
+            CREATE TABLE provider_statuses (scan_id TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL, discovered_count INTEGER NOT NULL, error_category TEXT, PRIMARY KEY(scan_id,provider));
+            CREATE TABLE endpoints (id TEXT PRIMARY KEY, scheme TEXT NOT NULL, host TEXT NOT NULL, port INTEGER, path TEXT NOT NULL, canonical_url TEXT NOT NULL UNIQUE, first_seen_scan TEXT NOT NULL, last_seen_scan TEXT NOT NULL);
+            CREATE TABLE endpoint_observations (endpoint_id TEXT NOT NULL, scan_id TEXT NOT NULL, raw_url TEXT NOT NULL, source TEXT NOT NULL, source_reference TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id,scan_id,raw_url,source,source_reference));
+            CREATE TABLE hostnames (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, source TEXT NOT NULL, discovered_from TEXT);
+            CREATE TABLE http_observations (id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, hostname TEXT NOT NULL, url TEXT NOT NULL, status_code INTEGER, title TEXT, server_header TEXT, rtt_ms INTEGER, content_length INTEGER, observed_at TEXT NOT NULL);")
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO scan_runs VALUES (?1, 'now', NULL, '[\"example.com\"]', 'phase2a')",
+                params![scan_id.to_string()],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO provider_statuses VALUES (?1, 'crt.sh', 'OK', 2, 3, NULL)",
+                params![scan_id.to_string()],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO endpoints VALUES ('ep', 'https', 'example.com', NULL, '/api', 'https://example.com/api', ?1, ?1)",
+                params![scan_id.to_string()],
+            )
+            .unwrap();
+        for source_reference in ["app.js", "admin.js"] {
+            legacy
+                .execute(
+                    "INSERT INTO endpoint_observations VALUES ('ep', ?1, 'https://example.com/api?a=1', 'javascript', ?2)",
+                    params![scan_id.to_string(), source_reference],
+                )
+                .unwrap();
+        }
+        legacy
+            .execute(
+                "INSERT INTO hostnames VALUES ('example.com', 'example.com', 'Seed', NULL)",
+                [],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO http_observations VALUES ('obs', ?1, 'example.com', 'https://example.com/api', 200, NULL, NULL, 1, 0, 'now')",
+                params![scan_id.to_string()],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let conn = init_db(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT config_hash FROM scan_runs WHERE id=?1",
+                params![scan_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "phase2a"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT attempts || ':' || discovered_count FROM provider_statuses WHERE scan_id=?1 AND provider='crt.sh'",
+                params![scan_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "2:3"
+        );
+        let references = conn
+            .prepare("SELECT source_reference FROM endpoint_observations WHERE endpoint_id='ep' ORDER BY source_reference")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(references, ["admin.js", "app.js"]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT canonical_url FROM endpoints WHERE id='ep'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "https://example.com/api"
+        );
+
+        conn.execute(
+            "INSERT INTO response_fingerprints VALUES ('obs', ?1, 'ep', 200, 7, 7, 1, 'raw', 'normal', NULL, 'headers', NULL, NULL, '\"unknown\"')",
+            params![scan_id.to_string()],
+        )
+        .unwrap();
+        let fingerprints = load_response_fingerprints(&conn, &scan_id, Some("ep")).unwrap();
+        assert_eq!(fingerprints.len(), 1);
+        assert_eq!(fingerprints[0].raw_hash, "raw");
+        assert_eq!(fingerprints[0].body_length, 7);
+
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 }

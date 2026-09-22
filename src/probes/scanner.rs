@@ -1,3 +1,4 @@
+use crate::scan::fingerprint::{self, ResponseFingerprint};
 use crate::scan::network::RequestScheduler;
 use std::time::Instant;
 
@@ -9,6 +10,7 @@ pub struct ScanResult {
     pub rtt_ms: Option<u64>,
     pub headers: reqwest::header::HeaderMap,
     pub body_snippet: String,
+    pub fingerprint: Option<ResponseFingerprint>,
 }
 
 const MAX_RESPONSE_BYTES: usize = 128 * 1024; // 128 KB limit
@@ -40,8 +42,15 @@ pub async fn probe_single_url(client: &RequestScheduler, url: &str) -> Option<Sc
     let response = client.get(&url.parse().ok()?).await.ok()?;
     let rtt_ms = start.elapsed().as_millis() as u64;
 
-    let status_code = Some(response.status().as_u16());
+    let status_code = response.status().as_u16();
     let headers = response.headers().clone();
+    let declared_length = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
     let server = headers
         .get("server")
         .and_then(|v| v.to_str().ok())
@@ -66,14 +75,25 @@ pub async fn probe_single_url(client: &RequestScheduler, url: &str) -> Option<Sc
 
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
     let title = extract_title(&body_str);
+    let body_complete = declared_length.is_none_or(|length| length <= body_bytes.len());
+    let fingerprint = Some(fingerprint::fingerprint(
+        status_code,
+        &body_bytes,
+        declared_length.unwrap_or(body_bytes.len()),
+        body_complete,
+        content_type,
+        &headers,
+        Some(rtt_ms),
+    ));
 
     Some(ScanResult {
-        status_code,
+        status_code: Some(status_code),
         title,
         server,
         rtt_ms: Some(rtt_ms),
         headers,
         body_snippet: body_str,
+        fingerprint,
     })
 }
 

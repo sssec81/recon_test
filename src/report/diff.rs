@@ -66,6 +66,7 @@ fn fetch_scan_http_obs(
             observed_at: chrono::DateTime::parse_from_rfc3339(&obs_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
+            fingerprint: None,
         })
     })?;
 

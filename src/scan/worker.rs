@@ -239,13 +239,14 @@ async fn emit_http(
         .await
         .map_err(|_| "event channel closed".to_string())?;
     }
-    let obs = HttpObservation::new(scan_id, hostname.to_string(), url).with_response(
+    let mut obs = HttpObservation::new(scan_id, hostname.to_string(), url).with_response(
         result.status_code,
         result.title,
         result.server,
         result.rtt_ms,
         None,
     );
+    obs.fingerprint = result.fingerprint;
     bus.send(ReconEvent::HttpObserved(obs))
         .await
         .map_err(|_| "event channel closed".to_string())

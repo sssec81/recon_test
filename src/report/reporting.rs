@@ -12,6 +12,7 @@ pub async fn report(
     http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scan_id = scan_run.id;
+    let _fingerprint_history = db::load_response_fingerprints(conn, &scan_id, None)?;
     // Idempotently retain canonical endpoint provenance for any observations written by
     // older databases or alternate ingestion paths.
     for observation in db::get_scan_observations(conn, &scan_id)? {
