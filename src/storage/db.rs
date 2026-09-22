@@ -198,6 +198,14 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_map_observations (
+            scan_id TEXT NOT NULL, script_url TEXT NOT NULL, map_url TEXT NOT NULL,
+            source_file TEXT NOT NULL, PRIMARY KEY(scan_id, map_url, source_file),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        )",
+        [],
+    )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS hostname_discoveries (
@@ -263,6 +271,7 @@ pub fn save_javascript_observation(
     conn: &Connection,
     scan_id: &Uuid,
     source_url: &str,
+    endpoint_source: &str,
     candidate: &crate::scan::javascript::JavaScriptCandidate,
 ) -> Result<()> {
     conn.execute(
@@ -272,8 +281,22 @@ pub fn save_javascript_observation(
     if let Some(url) = &candidate.resolved_url
         && matches!(candidate.kind, "http_call" | "url_literal")
     {
-        save_endpoint_observation(conn, scan_id, url, "javascript", Some(source_url))?;
+        save_endpoint_observation(conn, scan_id, url, endpoint_source, Some(source_url))?;
     }
+    Ok(())
+}
+
+pub fn save_source_map_observation(
+    conn: &Connection,
+    scan_id: &Uuid,
+    script_url: &str,
+    map_url: &str,
+    source_file: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO source_map_observations (scan_id, script_url, map_url, source_file) VALUES (?1, ?2, ?3, ?4)",
+        params![scan_id.to_string(), script_url, map_url, source_file],
+    )?;
     Ok(())
 }
 
@@ -912,6 +935,7 @@ mod tests {
             &conn,
             &run.id,
             "https://example.com/assets/app.js",
+            "javascript",
             &candidate,
         )
         .unwrap();

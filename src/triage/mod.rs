@@ -129,7 +129,45 @@ pub async fn run(
             && let Some(script) = script_text(&page)
         {
             for candidate in crate::scan::javascript::extract(&script, &response_url, scope) {
-                db::save_javascript_observation(conn, &scan_id, response_url.as_str(), &candidate)?;
+                db::save_javascript_observation(
+                    conn,
+                    &scan_id,
+                    response_url.as_str(),
+                    "javascript",
+                    &candidate,
+                )?;
+            }
+            if page
+                .evidence
+                .content_type
+                .as_deref()
+                .is_some_and(|content_type| content_type.contains("javascript"))
+                && let Some(map_url) = crate::scan::sourcemap::map_candidate(&response_url, &script)
+                && scope.allows_redirect_url(&map_url)
+                && let Some(map_page) = budget.fetch(&map_url).await
+                && let Some(map) = crate::scan::sourcemap::parse(&map_page.body)
+            {
+                for source_file in &map.source_files {
+                    db::save_source_map_observation(
+                        conn,
+                        &scan_id,
+                        response_url.as_str(),
+                        map_url.as_str(),
+                        source_file,
+                    )?;
+                }
+                for source in map.source_contents {
+                    for candidate in crate::scan::javascript::extract(&source, &response_url, scope)
+                    {
+                        db::save_javascript_observation(
+                            conn,
+                            &scan_id,
+                            map_url.as_str(),
+                            "source_map",
+                            &candidate,
+                        )?;
+                    }
+                }
             }
         }
         inventory.record_page(&response_url, &page, scope);
@@ -266,6 +304,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::models::ScanRun;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -423,6 +462,11 @@ mod tests {
                             "application/javascript",
                             "fetch('/api/items?id=2'); axios.post('/api/search', {query: 'x'});",
                         ),
+                        "/app.js.map" => (
+                            "200 OK",
+                            "application/json",
+                            "{\"sources\":[\"src/routes/orders.ts\"],\"sourcesContent\":[\"fetch('/api/orders?accountId=1')\"]}",
+                        ),
                         "/api/items?id=1" => ("200 OK", "application/json", "{\"item\":1}"),
                         "/api/items?id=3" => ("200 OK", "application/json", "{\"item\":3}"),
                         "/api/items?id=2" => (
@@ -456,7 +500,10 @@ mod tests {
                 });
             }
         });
-        let scan_id = Uuid::new_v4();
+        let conn = crate::storage::db::init_db(":memory:").unwrap();
+        let scan_run = ScanRun::new(vec!["127.0.0.1".into()], "source-map".into());
+        crate::storage::db::save_scan_run(&conn, &scan_run).unwrap();
+        let scan_id = scan_run.id;
         let seed = format!("http://127.0.0.1:{}/", address.port());
         let observations = vec![
             HttpObservation::new(scan_id, "127.0.0.1".into(), seed).with_response(
@@ -495,13 +542,29 @@ mod tests {
             &observations,
             config,
             scan_id,
-            None,
+            Some(&conn),
         )
         .await
         .unwrap();
         assert_eq!(review.pages_crawled, 8);
         assert_eq!(review.findings.len(), 4);
-        assert_eq!(review.requests_sent, 22);
+        assert_eq!(review.requests_sent, 23);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM source_map_observations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source FROM endpoint_observations WHERE source='source_map'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "source_map"
+        );
         assert_eq!(review.response_anomalies, 1);
         assert_eq!(review.duplicates_removed, 1);
         assert_eq!(review.findings_suppressed, 1);

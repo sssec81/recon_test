@@ -6,4 +6,5 @@ pub mod network;
 pub mod normalize;
 pub mod pipeline;
 pub mod scope;
+pub mod sourcemap;
 pub mod worker;
