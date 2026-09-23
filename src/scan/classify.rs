@@ -1,5 +1,5 @@
-//! Deterministic inventory classification. These tags are descriptive only;
-//! they are neither findings nor confidence assessments.
+//! Deterministic inventory classification. These labels describe inventory;
+//! they are not findings, vulnerability hypotheses, or confidence changes.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +25,7 @@ pub const ENDPOINT_CLASSES: &[&str] = &[
     "Static",
     "Unknown",
 ];
+
 pub const PARAMETER_SEMANTICS: &[&str] = &[
     "Url",
     "Redirect",
@@ -42,119 +43,184 @@ pub const PARAMETER_SEMANTICS: &[&str] = &[
     "Unknown",
 ];
 
-pub fn endpoint_classes(canonical_url: &str, raw_urls: &[String]) -> BTreeSet<&'static str> {
-    let value = format!("{} {}", canonical_url, raw_urls.join(" ")).to_ascii_lowercase();
+/// Classify only stable endpoint identity (host and normalized path). Query
+/// values are deliberately excluded: they describe observations/parameters and
+/// must not turn an endpoint into a class because a value contains a keyword.
+pub fn endpoint_classes(canonical_url: &str) -> BTreeSet<&'static str> {
+    let Ok(url) = reqwest::Url::parse(canonical_url) else {
+        return BTreeSet::from(["Unknown"]);
+    };
+    let mut tokens = BTreeSet::new();
+    if let Some(host) = url.host_str() {
+        tokens.extend(words(host));
+    }
+    tokens.extend(words(url.path()));
+
     let mut tags = BTreeSet::new();
-    tag(
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "Authentication",
         &[
-            "login", "logout", "signin", "signup", "auth", "oauth", "sso",
+            "auth",
+            "authentication",
+            "login",
+            "logout",
+            "signin",
+            "signup",
+            "oauth",
+            "sso",
         ],
     );
-    tag(
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "UserProfile",
-        &["user", "profile", "member"],
+        &["user", "users", "profile", "profiles", "member", "members"],
     );
-    tag(
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "Account",
-        &["account", "tenant", "organization", "org/"],
+        &[
+            "account",
+            "accounts",
+            "tenant",
+            "tenants",
+            "organization",
+            "organizations",
+        ],
     );
-    tag(&mut tags, &value, "Admin", &["admin", "administrator"]);
-    tag(
+    add(&mut tags, &tokens, "Admin", &["admin", "administrator"]);
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "Internal",
         &["internal", "private", "staff"],
     );
-    tag(
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "Debug",
         &["debug", "trace", "metrics", "actuator"],
     );
-    tag(&mut tags, &value, "Upload", &["upload", "attach"]);
-    tag(&mut tags, &value, "Download", &["download", "fetch-file"]);
-    tag(&mut tags, &value, "Export", &["export", "report"]);
-    tag(&mut tags, &value, "Import", &["import"]);
-    tag(
+    add(&mut tags, &tokens, "Upload", &["upload", "uploads"]);
+    add(&mut tags, &tokens, "Download", &["download", "downloads"]);
+    add(&mut tags, &tokens, "Export", &["export", "exports"]);
+    add(&mut tags, &tokens, "Import", &["import", "imports"]);
+    add(
         &mut tags,
-        &value,
+        &tokens,
         "Payment",
-        &["payment", "billing", "invoice", "checkout"],
+        &[
+            "payment", "payments", "billing", "invoice", "invoices", "checkout",
+        ],
     );
-    tag(&mut tags, &value, "Order", &["order", "cart"]);
-    tag(
+    add(
         &mut tags,
-        &value,
+        &tokens,
+        "Order",
+        &["order", "orders", "cart", "carts"],
+    );
+    add(
+        &mut tags,
+        &tokens,
         "Document",
-        &["document", "document", "file", "pdf"],
+        &[
+            "document",
+            "documents",
+            "doc",
+            "docs",
+            "file",
+            "files",
+            "pdf",
+        ],
     );
-    tag(&mut tags, &value, "Search", &["search", "query", "find"]);
-    tag(
-        &mut tags,
-        &value,
-        "Redirect",
-        &["redirect", "returnurl", "return_url", "next", "continue"],
-    );
-    tag(&mut tags, &value, "Webhook", &["webhook", "hook"]);
-    tag(&mut tags, &value, "GraphQL", &["graphql", "/gql"]);
-    tag(&mut tags, &value, "Api", &["/api", "/v1", "/v2", "/v3"]);
-    tag(
-        &mut tags,
-        &value,
-        "Static",
-        &["/assets/", "/static/", ".css", ".js", ".png", ".svg"],
-    );
+    add(&mut tags, &tokens, "Search", &["search", "find"]);
+    add(&mut tags, &tokens, "Redirect", &["redirect", "redirects"]);
+    add(&mut tags, &tokens, "Webhook", &["webhook", "webhooks"]);
+    add(&mut tags, &tokens, "GraphQL", &["graphql", "gql"]);
+
+    if tokens.contains("api")
+        || tokens.iter().any(|token| {
+            token.strip_prefix('v').is_some_and(|version| {
+                !version.is_empty() && version.chars().all(|character| character.is_ascii_digit())
+            })
+        })
+    {
+        tags.insert("Api");
+    }
+
+    const STATIC_EXTENSIONS: &[&str] = &[
+        "css", "js", "mjs", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "woff",
+        "woff2", "ttf", "eot",
+    ];
+    let extension = url
+        .path()
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    if tokens.contains("assets")
+        || tokens.contains("static")
+        || extension
+            .as_deref()
+            .is_some_and(|extension| STATIC_EXTENSIONS.contains(&extension))
+    {
+        tags.insert("Static");
+    }
+
     if tags.is_empty() {
         tags.insert("Unknown");
     }
     tags
 }
 
+/// Normalize separators and ASCII case so snake_case, kebab-case, and common
+/// camelCase spellings converge, then use exact aliases only.
 pub fn parameter_semantic(name: &str) -> &'static str {
-    let value = name.to_ascii_lowercase().replace(['_', '-'], "");
+    let value: String = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
     let semantic = if [
         "redirect",
         "redirecturi",
+        "redirecturl",
+        "return",
         "returnurl",
         "returnto",
         "next",
         "continue",
-        "destination",
     ]
     .contains(&value.as_str())
     {
         "Redirect"
-    } else if ["url", "uri", "link", "endpoint", "target"].contains(&value.as_str()) {
+    } else if ["url", "uri", "endpoint", "target"].contains(&value.as_str()) {
         "Url"
-    } else if ["file", "filename", "attachment", "upload"].contains(&value.as_str()) {
+    } else if ["file", "filename"].contains(&value.as_str()) {
         "File"
-    } else if ["path", "directory", "folder"].contains(&value.as_str()) {
+    } else if ["path", "filepath"].contains(&value.as_str()) {
         "Path"
-    } else if ["userid", "uid", "user"].contains(&value.as_str()) {
+    } else if ["userid", "uid"].contains(&value.as_str()) {
         "UserId"
-    } else if ["accountid", "account", "tenantid", "orgid"].contains(&value.as_str()) {
+    } else if value == "accountid" {
         "AccountId"
-    } else if ["id", "objectid", "documentid", "orderid", "resourceid"].contains(&value.as_str()) {
+    } else if ["id", "objectid"].contains(&value.as_str()) {
         "ObjectId"
-    } else if ["search", "q", "query", "term", "keyword"].contains(&value.as_str()) {
+    } else if ["q", "search", "keyword"].contains(&value.as_str()) {
         "Search"
-    } else if ["callback", "callbackurl", "cb"].contains(&value.as_str()) {
+    } else if value == "callback" {
         "Callback"
-    } else if ["webhook", "hook", "webhookurl"].contains(&value.as_str()) {
+    } else if ["webhook", "webhookurl"].contains(&value.as_str()) {
         "Webhook"
-    } else if ["template", "view", "layout"].contains(&value.as_str()) {
+    } else if value == "template" {
         "Template"
-    } else if ["page", "perpage", "limit", "offset", "cursor"].contains(&value.as_str()) {
-        "Pagination"
-    } else if ["filter", "sort", "fields", "include"].contains(&value.as_str()) {
+    } else if value == "query" {
         "Query"
+    } else if ["page", "offset", "limit", "cursor"].contains(&value.as_str()) {
+        "Pagination"
     } else {
         "Unknown"
     };
@@ -162,27 +228,91 @@ pub fn parameter_semantic(name: &str) -> &'static str {
     semantic
 }
 
-fn tag(tags: &mut BTreeSet<&'static str>, value: &str, tag: &'static str, terms: &[&str]) {
-    debug_assert!(ENDPOINT_CLASSES.contains(&tag));
-    if terms.iter().any(|term| value.contains(term)) {
-        tags.insert(tag);
+fn words(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn add(
+    tags: &mut BTreeSet<&'static str>,
+    tokens: &BTreeSet<String>,
+    class: &'static str,
+    aliases: &[&str],
+) {
+    debug_assert!(ENDPOINT_CLASSES.contains(&class));
+    if aliases.iter().any(|alias| tokens.contains(*alias)) {
+        tags.insert(class);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classes(path: &str) -> BTreeSet<&'static str> {
+        endpoint_classes(&format!("https://example.com{path}"))
+    }
+
     #[test]
-    fn classifies_multiple_tags_and_parameter_meaning() {
-        let tags = endpoint_classes(
-            "https://example.com/api/users/123",
-            &["https://example.com/api/users/123?redirect=/home".into()],
+    fn endpoint_fixture_matrix_is_multi_tagged_and_conservative() {
+        let fixtures: &[(&str, &[&str])] = &[
+            ("/api/users/profile", &["Api", "UserProfile"]),
+            ("/auth/login", &["Authentication"]),
+            ("/admin/internal/debug", &["Admin", "Internal", "Debug"]),
+            (
+                "/upload/download/export/import",
+                &["Upload", "Download", "Export", "Import"],
+            ),
+            (
+                "/payments/orders/documents",
+                &["Payment", "Order", "Document"],
+            ),
+            (
+                "/api/search/redirect/webhooks/graphql",
+                &["Api", "Search", "Redirect", "Webhook", "GraphQL"],
+            ),
+            ("/static/app.js", &["Static"]),
+            ("/ordinary/health", &["Unknown"]),
+        ];
+        for (path, expected) in fixtures {
+            assert_eq!(classes(path), expected.iter().copied().collect(), "{path}");
+        }
+        assert_eq!(
+            classes("/api/captain/authors/hookah"),
+            BTreeSet::from(["Api"])
         );
-        assert!(tags.contains("Api"));
-        assert!(tags.contains("UserProfile"));
-        assert!(tags.contains("Redirect"));
-        assert_eq!(parameter_semantic("redirect"), "Redirect");
-        assert_eq!(parameter_semantic("account_id"), "AccountId");
-        assert_eq!(parameter_semantic("unrelated"), "Unknown");
+        assert_eq!(
+            classes("/ordinary?next=/admin"),
+            BTreeSet::from(["Unknown"])
+        );
+    }
+
+    #[test]
+    fn parameter_fixture_matrix_handles_case_separators_and_ambiguity() {
+        let fixtures = [
+            ("redirect_uri", "Redirect"),
+            ("returnUrl", "Redirect"),
+            ("url", "Url"),
+            ("file_name", "File"),
+            ("filePath", "Path"),
+            ("id", "ObjectId"),
+            ("user_id", "UserId"),
+            ("userId", "UserId"),
+            ("account_id", "AccountId"),
+            ("accountId", "AccountId"),
+            ("q", "Search"),
+            ("callback", "Callback"),
+            ("webhook_url", "Webhook"),
+            ("template", "Template"),
+            ("query", "Query"),
+            ("cursor", "Pagination"),
+            ("identity", "Unknown"),
+            ("destination", "Unknown"),
+        ];
+        for (name, expected) in fixtures {
+            assert_eq!(parameter_semantic(name), expected, "{name}");
+        }
     }
 }

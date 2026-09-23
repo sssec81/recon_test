@@ -315,29 +315,38 @@ pub fn save_source_map_observation(
 /// Rebuilds scan-scoped, deterministic labels from all retained endpoint
 /// observations. This operates solely on the local inventory database.
 pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> {
-    let mut endpoints = conn.prepare(
-        "SELECT e.id, e.canonical_url FROM endpoints e JOIN endpoint_observations o ON o.endpoint_id=e.id WHERE o.scan_id=?1 GROUP BY e.id, e.canonical_url",
-    )?;
-    let rows = endpoints
+    let scan_id = scan_id.to_string();
+    let tx = conn.unchecked_transaction()?;
+    let rows = tx.prepare(
+        "SELECT e.id, e.canonical_url FROM endpoints e JOIN endpoint_observations o ON o.endpoint_id=e.id WHERE o.scan_id=?1 GROUP BY e.id, e.canonical_url ORDER BY e.canonical_url, e.id",
+    )?
         .query_map(params![scan_id.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>>>()?;
+    // Derived semantics are rebuilt, not accumulated. This also removes stale
+    // rows after a classifier upgrade while retaining every raw observation.
+    tx.execute(
+        "DELETE FROM endpoint_classifications WHERE scan_id=?1",
+        params![scan_id],
+    )?;
+    tx.execute(
+        "DELETE FROM parameter_semantics WHERE scan_id=?1",
+        params![scan_id],
+    )?;
     for (endpoint_id, canonical_url) in rows {
         let raw_urls = {
-            let mut statement = conn.prepare(
-                "SELECT raw_url FROM endpoint_observations WHERE scan_id=?1 AND endpoint_id=?2",
+            let mut statement = tx.prepare(
+                "SELECT raw_url FROM endpoint_observations WHERE scan_id=?1 AND endpoint_id=?2 ORDER BY raw_url, source, source_reference",
             )?;
             statement
-                .query_map(params![scan_id.to_string(), endpoint_id], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(params![scan_id, endpoint_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>>>()?
         };
-        for class in crate::scan::classify::endpoint_classes(&canonical_url, &raw_urls) {
-            conn.execute(
+        for class in crate::scan::classify::endpoint_classes(&canonical_url) {
+            tx.execute(
                 "INSERT OR IGNORE INTO endpoint_classifications (scan_id, endpoint_id, class) VALUES (?1, ?2, ?3)",
-                params![scan_id.to_string(), endpoint_id, class],
+                params![scan_id, endpoint_id, class],
             )?;
         }
         let mut parameters = std::collections::BTreeSet::new();
@@ -347,13 +356,13 @@ pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> 
             }
         }
         for name in parameters {
-            conn.execute(
-                "INSERT OR REPLACE INTO parameter_semantics (scan_id, endpoint_id, parameter_name, semantic) VALUES (?1, ?2, ?3, ?4)",
-                params![scan_id.to_string(), endpoint_id, name, crate::scan::classify::parameter_semantic(&name)],
+            tx.execute(
+                "INSERT INTO parameter_semantics (scan_id, endpoint_id, parameter_name, semantic) VALUES (?1, ?2, ?3, ?4)",
+                params![scan_id, endpoint_id, name, crate::scan::classify::parameter_semantic(&name)],
             )?;
         }
     }
-    Ok(())
+    tx.commit()
 }
 
 pub fn load_response_fingerprints(
@@ -1013,18 +1022,79 @@ mod tests {
     }
 
     #[test]
-    fn inventory_classification_is_multi_tagged_and_scan_scoped() {
+    fn inventory_classification_covers_provenance_deduplication_and_scan_isolation() {
         let conn = init_db(":memory:").unwrap();
         let run = ScanRun::new(vec!["example.com".into()], "classify".into());
+        let other = ScanRun::new(vec!["example.com".into()], "other".into());
         save_scan_run(&conn, &run).unwrap();
+        save_scan_run(&conn, &other).unwrap();
+        // Two historical observations with different values share one canonical
+        // endpoint and yield a deduplicated set of parameter names.
         save_endpoint_observation(
             &conn,
             &run.id,
-            "https://example.com/api/users/123?redirect=/home&account_id=7",
+            "https://example.com/admin/api/users/redirect?redirect=/home&account_id=7&page=1",
             "historical",
             Some("wayback"),
         )
         .unwrap();
+        save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://example.com/admin/api/users/redirect?redirect=/dashboard&account_id=8&page=2",
+            "historical",
+            Some("common_crawl"),
+        )
+        .unwrap();
+        // URL-bearing JavaScript/source-map evidence is safely associated.
+        for (source, url) in [
+            (
+                "javascript",
+                "https://example.com/api/search?q=rust&query=viewer",
+            ),
+            (
+                "source_map",
+                "https://example.com/api/search?q=rust&cursor=end",
+            ),
+        ] {
+            let candidate = crate::scan::javascript::JavaScriptCandidate {
+                kind: "http_call",
+                raw_value: url.into(),
+                resolved_url: Some(url.into()),
+            };
+            save_javascript_observation(
+                &conn,
+                &run.id,
+                "https://example.com/app.js",
+                source,
+                &candidate,
+            )
+            .unwrap();
+        }
+        // An unassociated JS name remains intelligence and is not invented as
+        // an endpoint parameter.
+        let loose = crate::scan::javascript::JavaScriptCandidate {
+            kind: "parameter_name",
+            raw_value: "userId".into(),
+            resolved_url: None,
+        };
+        save_javascript_observation(
+            &conn,
+            &run.id,
+            "https://example.com/app.js",
+            "javascript",
+            &loose,
+        )
+        .unwrap();
+        save_endpoint_observation(
+            &conn,
+            &other.id,
+            "https://example.com/debug?file=x",
+            "http_probe",
+            None,
+        )
+        .unwrap();
+
         classify_scan_inventory(&conn, &run.id).unwrap();
         let classes = conn
             .prepare("SELECT class FROM endpoint_classifications WHERE scan_id=?1 ORDER BY class")
@@ -1036,14 +1106,59 @@ mod tests {
         assert!(classes.contains(&"Api".into()));
         assert!(classes.contains(&"UserProfile".into()));
         assert!(classes.contains(&"Redirect".into()));
+        assert!(classes.contains(&"Admin".into()));
+        assert_eq!(
+            conn.prepare("SELECT parameter_name || ':' || semantic FROM parameter_semantics WHERE scan_id=?1 ORDER BY parameter_name")
+                .unwrap().query_map(params![run.id.to_string()], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<Result<Vec<_>>>().unwrap(),
+            ["account_id:AccountId", "cursor:Pagination", "page:Pagination", "q:Search", "query:Query", "redirect:Redirect"]
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM parameter_semantics WHERE scan_id=?1 AND parameter_name='userId'", params![run.id.to_string()], |row| row.get::<_, i64>(0)).unwrap(), 0);
+
+        let before = conn
+            .query_row(
+                "SELECT count(*) FROM endpoint_classifications WHERE scan_id=?1",
+                params![run.id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        classify_scan_inventory(&conn, &run.id).unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT semantic FROM parameter_semantics WHERE scan_id=?1 AND parameter_name='redirect'",
+                "SELECT count(*) FROM endpoint_classifications WHERE scan_id=?1",
                 params![run.id.to_string()],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-            "Redirect"
+            before
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM endpoint_classifications WHERE scan_id=?1",
+                params![other.id.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        classify_scan_inventory(&conn, &other.id).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT class FROM endpoint_classifications WHERE scan_id=?1",
+                params![other.id.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Debug"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM endpoint_classifications WHERE scan_id=?1",
+                params![run.id.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            before
         );
     }
 
@@ -1177,6 +1292,28 @@ mod tests {
         assert_eq!(fingerprints.len(), 1);
         assert_eq!(fingerprints[0].raw_hash, "raw");
         assert_eq!(fingerprints[0].body_length, 7);
+
+        // Phase 2F tables are added non-destructively and can classify the
+        // endpoint observations retained by an older database.
+        classify_scan_inventory(&conn, &scan_id).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT class FROM endpoint_classifications WHERE scan_id=?1",
+                params![scan_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Api"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT semantic FROM parameter_semantics WHERE scan_id=?1 AND parameter_name='a'",
+                params![scan_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Unknown"
+        );
 
         drop(conn);
         std::fs::remove_file(path).unwrap();
