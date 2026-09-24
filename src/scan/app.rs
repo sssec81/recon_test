@@ -19,6 +19,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+fn verification_request_budget(enabled: bool, max_opportunities: usize, requests: usize) -> usize {
+    if enabled {
+        max_opportunities.saturating_mul(requests.min(2))
+    } else {
+        0
+    }
+}
+
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting Async Recon Engine v1.0.0...");
 
@@ -99,15 +107,17 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("recon_test/1.0.0")
         .danger_accept_invalid_certs(true)
         .build()?;
+    let verification_budget = verification_request_budget(
+        args.controlled_verification,
+        args.verification_max_opportunities,
+        args.verification_requests_per_opportunity,
+    );
     let target_scheduler = RequestScheduler::new(
         probe_client.clone(),
         scope_policy.clone(),
         args.concurrency,
         args.triage_max_requests
-            .saturating_add(
-                args.verification_max_opportunities
-                    .saturating_mul(args.verification_requests_per_opportunity.min(2)),
-            )
+            .saturating_add(verification_budget)
             .saturating_add(args.max_targets.saturating_mul(8)),
         20,
         5,
@@ -406,4 +416,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     reporting::report(args, &conn, &scan_run, &http_client).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verification_request_budget;
+
+    #[test]
+    fn verification_budget_is_added_only_when_enabled() {
+        assert_eq!(verification_request_budget(false, 10, 2), 0);
+        assert_eq!(verification_request_budget(true, 10, 2), 20);
+        assert_eq!(verification_request_budget(true, 10, 99), 20);
+    }
 }
