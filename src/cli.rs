@@ -47,9 +47,9 @@ pub struct Args {
     #[arg(long, num_args = 2)]
     pub diff: Option<Vec<String>>,
 
-    /// Enable AI attack surface analysis
-    #[arg(long, default_value_t = false)]
-    pub llm_analyze: bool,
+    /// Run the optional Phase 6 analyst over sanitized persisted evidence
+    #[arg(long, visible_alias = "llm-analyze", default_value_t = false)]
+    pub ai_analyze: bool,
 
     /// LLM backend provider for AI analysis
     #[arg(long, value_enum, default_value_t = LlmBackend::Ollama)]
@@ -74,6 +74,34 @@ pub struct Args {
     /// Maximum completion tokens for LLM analysis
     #[arg(long, default_value_t = 1024)]
     pub llm_max_tokens: u32,
+
+    /// Maximum ranked candidates included in Phase 6
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    pub ai_max_candidates: usize,
+
+    /// Maximum related endpoint summaries included in Phase 6
+    #[arg(long, default_value_t = 40, value_parser = parse_positive_usize)]
+    pub ai_max_related_endpoints: usize,
+
+    /// Maximum provider requests made by Phase 6
+    #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
+    pub ai_max_requests: usize,
+
+    /// Maximum serialized sanitized input bytes per provider request
+    #[arg(long, default_value_t = 65536, value_parser = parse_positive_usize)]
+    pub ai_max_input_bytes: usize,
+
+    /// Maximum provider response bytes accepted by Phase 6
+    #[arg(long, default_value_t = 65536, value_parser = parse_positive_usize)]
+    pub ai_max_output_bytes: usize,
+
+    /// Phase 6 provider timeout in seconds
+    #[arg(long, default_value_t = 120, value_parser = parse_positive_u64)]
+    pub ai_timeout_seconds: u64,
+
+    /// Bounded retry count for transient Phase 6 provider failures
+    #[arg(long, default_value_t = 1)]
+    pub ai_retries: usize,
 
     /// Run bounded crawl and evidence-backed candidate triage after recon
     #[arg(long, default_value_t = false)]

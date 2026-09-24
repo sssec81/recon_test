@@ -1,5 +1,5 @@
-use crate::cli::{Args, LlmBackend};
-use crate::report::{diff, exporter, llm};
+use crate::cli::Args;
+use crate::report::{diff, exporter};
 use crate::storage::db;
 use crate::storage::models::ScanRun;
 use rusqlite::Connection;
@@ -9,7 +9,7 @@ pub async fn report(
     args: Args,
     conn: &Connection,
     scan_run: &ScanRun,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scan_id = scan_run.id;
     let _fingerprint_history = db::load_response_fingerprints(conn, &scan_id, None)?;
@@ -142,70 +142,6 @@ pub async fn report(
                 }
             }
             Err(e) => return Err(format!("Failed to calculate scan diff: {e}").into()),
-        }
-    }
-
-    // Generate optional AI summaries.
-    if args.llm_analyze && !args.triage {
-        let provider = match args.llm_backend {
-            LlmBackend::Ollama => llm::LlmProvider::Ollama {
-                url: args.ollama_url.clone(),
-                model: args.ollama_model.clone(),
-            },
-            LlmBackend::Anthropic => {
-                if let Some(key) = args
-                    .anthropic_api_key
-                    .as_ref()
-                    .filter(|k| !k.trim().is_empty())
-                {
-                    llm::LlmProvider::Anthropic {
-                        api_key: key.clone(),
-                        model: args.anthropic_model.clone(),
-                        max_tokens: args.llm_max_tokens,
-                    }
-                } else {
-                    eprintln!(
-                        "❌ Error: ANTHROPIC_API_KEY is required when --llm-backend is set to 'anthropic'. Set ANTHROPIC_API_KEY env var or pass --anthropic-api-key."
-                    );
-                    return Err("Missing ANTHROPIC_API_KEY".into());
-                }
-            }
-        };
-
-        let scan_observations = db::get_scan_observations(conn, &scan_id)?;
-        let backend_name = match &provider {
-            llm::LlmProvider::Ollama { model, url } => format!("Ollama ({}) at '{}'", model, url),
-            llm::LlmProvider::Anthropic { model, .. } => format!("Anthropic Claude ({})", model),
-        };
-        println!(
-            "\n🤖 Generating AI Attack Surface Assessment via {}...",
-            backend_name
-        );
-
-        match llm::analyze_scan_observations(http_client, &provider, &scan_observations).await {
-            Ok(ai_summary) => {
-                println!("\n=== 🤖 AI Attack Surface Assessment ===");
-                println!("{}", ai_summary.trim());
-                println!("======================================");
-            }
-            Err(e) => eprintln!("⚠️  AI analysis failed: {}", e),
-        }
-
-        if let Some((id_a, id_b)) = diff_run_ids
-            && let Ok(diff_result) = diff::compare_scan_runs(conn, &id_a, &id_b)
-        {
-            println!(
-                "\n🤖 Generating AI Scan Diff Threat Assessment via {}...",
-                backend_name
-            );
-            match llm::analyze_scan_diff(http_client, &provider, &diff_result).await {
-                Ok(diff_ai_summary) => {
-                    println!("\n=== 🤖 AI Scan Diff Assessment ===");
-                    println!("{}", diff_ai_summary.trim());
-                    println!("=================================");
-                }
-                Err(e) => eprintln!("⚠️  AI diff analysis failed: {}", e),
-            }
         }
     }
 

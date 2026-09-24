@@ -263,6 +263,38 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             scan_id TEXT PRIMARY KEY, candidate_count INTEGER NOT NULL,
             output_version INTEGER NOT NULL,
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_analysis_runs (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+            analysis_version INTEGER NOT NULL, prompt_version INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL, input_hash TEXT NOT NULL,
+            analysis_type TEXT NOT NULL, status TEXT NOT NULL, response_json TEXT,
+            error_class TEXT, started_at TEXT NOT NULL, finished_at TEXT,
+            UNIQUE(scan_id,input_hash,analysis_type,status),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_candidate_analyses (
+            analysis_run_id TEXT NOT NULL, candidate_id TEXT NOT NULL, summary TEXT NOT NULL,
+            reasoning_confidence TEXT NOT NULL, why_interesting TEXT NOT NULL,
+            limitations TEXT NOT NULL, manual_validation TEXT NOT NULL,
+            PRIMARY KEY(analysis_run_id,candidate_id),
+            FOREIGN KEY(analysis_run_id) REFERENCES ai_analysis_runs(id),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_hypotheses (
+            id TEXT PRIMARY KEY, analysis_run_id TEXT NOT NULL, candidate_id TEXT,
+            hypothesis_type TEXT NOT NULL, description TEXT NOT NULL,
+            supporting_evidence TEXT NOT NULL, manual_validation TEXT NOT NULL,
+            suggested_verifier TEXT,
+            FOREIGN KEY(analysis_run_id) REFERENCES ai_analysis_runs(id),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id)
+        );
+        CREATE TABLE IF NOT EXISTS ai_relationships (
+            id TEXT PRIMARY KEY, analysis_run_id TEXT NOT NULL, candidate_id TEXT,
+            source_endpoint TEXT NOT NULL, target_endpoint TEXT NOT NULL,
+            relationship_type TEXT NOT NULL, explanation TEXT NOT NULL,
+            FOREIGN KEY(analysis_run_id) REFERENCES ai_analysis_runs(id),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id)
         );",
     )?;
     conn.execute_batch(

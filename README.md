@@ -71,13 +71,20 @@ The scanner tries the selected scheme even if the port check missed it. Failed w
 | `--scheme-strategy <STRATEGY>` | Probing scheme (`https-first`, `https-only`, `both-parallel`) | `https-first` |
 | `--diff-last` | Diff against the previous compatible finished run | `false` |
 | `--diff <UUID_A> <UUID_B>` | Compare specific historical scan runs | None |
-| `--llm-analyze` | Enable optional AI analysis; with `--triage`, analyze verified review candidates only | `false` |
+| `--ai-analyze` | Run optional Phase 6 analysis after deterministic review (`--llm-analyze` remains an alias) | `false` |
 | `--ollama-model <MODEL>` | Local Ollama model name | `llama3:8b` |
 | `--ollama-url <URL>` | Local Ollama API endpoint | `http://localhost:11434` |
 | `--llm-backend <BACKEND>` | AI backend (`ollama` or `anthropic`) | `ollama` |
 | `--anthropic-api-key <KEY>` | Anthropic API key (or use `ANTHROPIC_API_KEY`) | None |
 | `--anthropic-model <MODEL>` | Anthropic model name | `claude-3-5-haiku-20241022` |
 | `--llm-max-tokens <N>` | Maximum AI response tokens | `1024` |
+| `--ai-max-candidates <N>` | Maximum ranked candidates supplied to Phase 6 (hard-capped at 10) | `10` |
+| `--ai-max-related-endpoints <N>` | Maximum related endpoint summaries (hard-capped at 40) | `40` |
+| `--ai-max-requests <N>` | Maximum bounded provider attempts | `2` |
+| `--ai-max-input-bytes <N>` | Maximum sanitized provider input size | `65536` |
+| `--ai-max-output-bytes <N>` | Maximum accepted structured response size | `65536` |
+| `--ai-timeout-seconds <N>` | Provider request timeout | `120` |
+| `--ai-retries <N>` | Bounded provider retry count | `1` |
 | `--triage` | Run bounded evidence triage after recon | `false` |
 | `--triage-max-pages <N>` | Maximum pages or scripts fetched in triage | `250` |
 | `--triage-max-depth <N>` | Maximum crawl depth from discovered endpoints | `2` |
@@ -103,9 +110,9 @@ The scanner tries the selected scheme even if the port check missed it. Failed w
 cargo run -- -t example.com --scope example.com --passive true
 ```
 
-### Run scan with automatic local AI attack surface analysis (Ollama):
+### Run optional constrained AI analysis with Ollama:
 ```bash
-cargo run -- -t example.com --scope example.com --llm-analyze
+cargo run -- -t example.com --scope example.com --ai-analyze
 ```
 
 For Anthropic analysis, set `ANTHROPIC_API_KEY` and add `--llm-backend anthropic`.
@@ -142,11 +149,15 @@ Only Phase 4 candidates with a persisted rank enter the primary package; Phase 4
 
 Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation.
 
-Add `--llm-analyze` to a triage run to request one optional AI review of up to five verified findings. The model receives only finding IDs, categories, sanitized route paths, query parameter names, status and content type, and repeat/control counts. Full URLs, query values, response bodies, titles, hashes, and headers are not sent. AI suggestions are saved in `ai_triage.json` and `ai_triage.md`; they cannot change scanner confidence, add findings, or trigger HTTP checks. Ollama is the default local backend. Use `--llm-backend anthropic` and `ANTHROPIC_API_KEY` for cloud analysis. If AI fails, the deterministic review queue remains available.
+### Constrained AI analyst
+
+Phase 6 is optional, disabled by default, and runs only after the deterministic Phase 5 package. It reasons over a bounded, structurally sanitized model containing ranked candidates and related endpoint paths from SQLite. It has no target-network authority and cannot change deterministic scores, ranks, suppression, or evidence states; it cannot confirm vulnerabilities. Results are advisory and require manual validation.
+
+Use `--ai-analyze` with the default local Ollama provider, or select `--llm-backend anthropic` and provide `ANTHROPIC_API_KEY`. Provider/model, candidate and related-endpoint caps, request attempts, input/output sizes, timeout, and retries are configurable and bounded. Identical successful analyses are cached. Output is written separately to `triage_output/ai_analysis.json` and `triage_output/ai_review.md`. Query values, credentials, headers, cookies, bodies, redirect destinations, and raw JavaScript/source maps are never included. Provider failure is nonfatal and leaves all deterministic scanner outputs intact.
 
 ### Rescan, auto-diff against previous run, and generate AI diff analysis:
 ```bash
-cargo run -- -t example.com --diff-last --llm-analyze
+cargo run -- -t example.com --diff-last --ai-analyze
 ```
 
 ## Database migration

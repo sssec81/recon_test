@@ -1,3 +1,4 @@
+mod analyst;
 mod cli;
 mod correlation;
 mod probes;
