@@ -107,6 +107,18 @@ pub struct Args {
     #[arg(long, default_value = "triage_output")]
     pub triage_dir: String,
 
+    /// Run Phase 3 bounded, non-destructive verification of existing intelligence
+    #[arg(long, default_value_t = false)]
+    pub controlled_verification: bool,
+
+    /// Maximum Phase 3 opportunities actively checked per scan
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    pub verification_max_opportunities: usize,
+
+    /// Maximum Phase 3 requests per opportunity (hard-capped at 2)
+    #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
+    pub verification_requests_per_opportunity: usize,
+
     /// Export scan observations to JSON file
     #[arg(long)]
     pub export_json: Option<String>,

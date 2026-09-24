@@ -216,6 +216,23 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, parameter_name TEXT NOT NULL,
             semantic TEXT NOT NULL, PRIMARY KEY(scan_id, endpoint_id, parameter_name),
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
+        CREATE TABLE IF NOT EXISTS investigation_opportunities (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL,
+            canonical_url TEXT NOT NULL, category TEXT NOT NULL, reason TEXT NOT NULL,
+            supporting_evidence TEXT NOT NULL, priority INTEGER NOT NULL,
+            evidence_state TEXT NOT NULL, suppression_reason TEXT,
+            UNIQUE(scan_id, endpoint_id, category),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
+        CREATE TABLE IF NOT EXISTS verification_attempts (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL, request_type TEXT NOT NULL,
+            request_url TEXT NOT NULL, baseline_observation_id TEXT,
+            fingerprint TEXT, comparison TEXT NOT NULL, failure_reason TEXT,
+            created_at TEXT NOT NULL, UNIQUE(opportunity_id, sequence),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(opportunity_id) REFERENCES investigation_opportunities(id)
         );",
     )?;
 
@@ -1313,6 +1330,23 @@ mod tests {
             )
             .unwrap(),
             "Unknown"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM investigation_opportunities",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM verification_attempts", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
         );
 
         drop(conn);

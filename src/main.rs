@@ -4,6 +4,7 @@ mod report;
 mod scan;
 mod storage;
 mod triage;
+mod verification;
 
 use clap::Parser;
 

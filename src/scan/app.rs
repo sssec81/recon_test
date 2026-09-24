@@ -104,6 +104,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         scope_policy.clone(),
         args.concurrency,
         args.triage_max_requests
+            .saturating_add(
+                args.verification_max_opportunities
+                    .saturating_mul(args.verification_requests_per_opportunity.min(2)),
+            )
             .saturating_add(args.max_targets.saturating_mul(8)),
         20,
         5,
@@ -322,6 +326,21 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     db::finish_scan_run(&conn, &scan_run.id)?;
 
     println!("🎉 ScanRun {} completed successfully!", scan_run.id);
+
+    db::classify_scan_inventory(&conn, &scan_run.id)?;
+    if args.controlled_verification {
+        crate::verification::run(
+            scan_context.target_http.as_ref(),
+            &scan_context.scope,
+            &conn,
+            scan_run.id,
+            crate::verification::VerificationConfig {
+                max_opportunities: args.verification_max_opportunities,
+                max_requests_per_opportunity: args.verification_requests_per_opportunity.min(2),
+            },
+        )
+        .await?;
+    }
 
     if args.triage {
         let observations = db::get_scan_observations(&conn, &scan_run.id)?;
