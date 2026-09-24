@@ -258,6 +258,11 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             PRIMARY KEY(candidate_id, opportunity_id),
             FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id),
             FOREIGN KEY(opportunity_id) REFERENCES investigation_opportunities(id)
+        );
+        CREATE TABLE IF NOT EXISTS review_packages (
+            scan_id TEXT PRIMARY KEY, candidate_count INTEGER NOT NULL,
+            output_version INTEGER NOT NULL,
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
         );",
     )?;
     conn.execute_batch(

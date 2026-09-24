@@ -424,6 +424,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             output_dir: std::path::PathBuf::from(&args.triage_dir),
         },
     )?;
+    crate::review::generate(&conn, scan_run.id, std::path::Path::new(&args.triage_dir))?;
 
     reporting::report(args, &conn, &scan_run, &http_client).await
 }

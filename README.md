@@ -134,6 +134,12 @@ Phase 4 runs after local evidence collection whether or not controlled verificat
 
 The default queue contains at most 10 unsuppressed candidates scoring at least 20. The 0–100 score means only “inspect this sooner”; it is not vulnerability severity or confirmation. Every point is exported with a named explanation, lower-ranked and suppressed candidates remain in SQLite, and all candidates require manual validation. Query values, redirect values, response bodies, cookies, and authorization material are excluded from Phase 4 persistence and export.
 
+### Human review package
+
+Phase 5 runs automatically after deterministic ranking and reads only evidence already stored in SQLite. It makes no network, provider, or AI requests. The configured `--triage-dir` receives `review_report.md` for human review and a deterministic, sanitized `review_report.json` for tooling.
+
+Only Phase 4 candidates with a persisted rank enter the primary package; Phase 4 remains authoritative for ranking, score, suppression, and evidence relationships. Scores are investigation priority, not severity, and the package never confirms a vulnerability automatically. Manual validation is required for every candidate.
+
 Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation.
 
 Add `--llm-analyze` to a triage run to request one optional AI review of up to five verified findings. The model receives only finding IDs, categories, sanitized route paths, query parameter names, status and content type, and repeat/control counts. Full URLs, query values, response bodies, titles, hashes, and headers are not sent. AI suggestions are saved in `ai_triage.json` and `ai_triage.md`; they cannot change scanner confidence, add findings, or trigger HTTP checks. Ollama is the default local backend. Use `--llm-backend anthropic` and `ANTHROPIC_API_KEY` for cloud analysis. If AI fails, the deterministic review queue remains available.

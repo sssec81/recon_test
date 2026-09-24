@@ -2,6 +2,7 @@ mod cli;
 mod correlation;
 mod probes;
 mod report;
+mod review;
 mod scan;
 mod storage;
 mod triage;
