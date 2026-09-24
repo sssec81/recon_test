@@ -1,4 +1,5 @@
 mod cli;
+mod correlation;
 mod probes;
 mod report;
 mod scan;

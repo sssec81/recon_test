@@ -89,6 +89,8 @@ The scanner tries the selected scheme even if the port check missed it. Failed w
 | `--controlled-verification` | Run Phase 3 controlled verification against confirmed-live inventory | `false` |
 | `--verification-max-opportunities <N>` | Maximum Phase 3 opportunities actively checked | `10` |
 | `--verification-requests-per-opportunity <N>` | Phase 3 request limit per opportunity; hard-capped at two | `2` |
+| `--review-max-candidates <N>` | Maximum Phase 4 candidates shown and exported | `10` |
+| `--review-min-score <0-100>` | Minimum investigation-priority score for the primary queue | `20` |
 | `--export-json <PATH>` | Export scan observations to JSON file | None |
 | `--export-csv <PATH>` | Export scan observations to CSV file | None |
 | `--export-diff-json <PATH>` | Export scan diff results to JSON file | None |
@@ -125,6 +127,12 @@ cargo run --release -- -t example.com --scope example.com --controlled-verificat
 ```
 
 Phase 3 deterministically narrows endpoint classifications, parameter semantics, fingerprints, and provenance into investigation opportunities. Only confirmed-live, complete GET baselines are eligible. An eligible opportunity receives one repeat and, for redirect/search semantics, at most one same-origin inert control. Every request uses the shared scheduler and its scope, redirect, pacing, concurrency, deadline, and request-budget controls. Results and suppression reasons are stored in `investigation_opportunities` and `verification_attempts`; console output explicitly remains a manual-review candidate and does not create vulnerability findings. Request URLs have values redacted, and persisted fingerprints redact redirect targets.
+
+### Deterministic candidate ranking
+
+Phase 4 runs after local evidence collection whether or not controlled verification is enabled. It makes zero network or AI requests. The phase groups classifications, parameter semantics, provenance, fingerprints, Phase 3 opportunities, and conservative same-scope history by canonical endpoint, then writes the top deterministic review queue to `triage_output/investigation_candidates.json`.
+
+The default queue contains at most 10 unsuppressed candidates scoring at least 20. The 0–100 score means only “inspect this sooner”; it is not vulnerability severity or confirmation. Every point is exported with a named explanation, lower-ranked and suppressed candidates remain in SQLite, and all candidates require manual validation. Query values, redirect values, response bodies, cookies, and authorization material are excluded from Phase 4 persistence and export.
 
 Triage recognizes directory indexes, detailed server errors, and object identifiers in URLs. It also compares responses from the same route and parameter set; a stable 5xx response against a stable successful control can become a review candidate. Each candidate must survive repeat checks for status, content type, response size, and final URL. Directory and server-error checks use two control requests; response anomalies alternate baseline and control requests to catch drift. Object-ID pages are repeated, but ownership and authorization still require two authorized test accounts. `Confirmed` is reserved for manual validation.
 

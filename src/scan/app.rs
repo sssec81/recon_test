@@ -415,6 +415,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    crate::correlation::run(
+        &conn,
+        scan_run.id,
+        crate::correlation::ReviewConfig {
+            max_candidates: args.review_max_candidates,
+            min_score: args.review_min_score,
+            output_dir: std::path::PathBuf::from(&args.triage_dir),
+        },
+    )?;
+
     reporting::report(args, &conn, &scan_run, &http_client).await
 }
 

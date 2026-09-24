@@ -119,6 +119,14 @@ pub struct Args {
     #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
     pub verification_requests_per_opportunity: usize,
 
+    /// Maximum Phase 4 candidates shown and exported in the primary review queue
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    pub review_max_candidates: usize,
+
+    /// Minimum deterministic investigation score for the primary review queue
+    #[arg(long, default_value_t = 20, value_parser = parse_review_score)]
+    pub review_min_score: u16,
+
     /// Export scan observations to JSON file
     #[arg(long)]
     pub export_json: Option<String>,
@@ -164,6 +172,17 @@ fn parse_positive_u64(value: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_review_score(value: &str) -> Result<u16, String> {
+    let score = value
+        .parse::<u16>()
+        .map_err(|_| "expected an integer from 0 through 100".to_string())?;
+    if score <= 100 {
+        Ok(score)
+    } else {
+        Err("review minimum score must be from 0 through 100".into())
+    }
+}
+
 pub fn load_targets_from_file(file_path: &str) -> std::io::Result<Vec<String>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -186,6 +205,16 @@ mod tests {
         assert!(
             Args::try_parse_from(["recon_test", "-t", "example.com", "--max-targets", "0"])
                 .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "recon_test",
+                "-t",
+                "example.com",
+                "--review-min-score",
+                "101"
+            ])
+            .is_err()
         );
     }
 }

@@ -233,7 +233,37 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             created_at TEXT NOT NULL, UNIQUE(opportunity_id, sequence),
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
             FOREIGN KEY(opportunity_id) REFERENCES investigation_opportunities(id)
+        );
+        CREATE TABLE IF NOT EXISTS correlated_candidates (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL,
+            canonical_url TEXT NOT NULL, evidence_state TEXT NOT NULL, score INTEGER NOT NULL,
+            categories TEXT NOT NULL, endpoint_classes TEXT NOT NULL, parameters TEXT NOT NULL,
+            provenance TEXT NOT NULL, review_guidance TEXT NOT NULL,
+            suppression_reason TEXT, ranked BOOLEAN NOT NULL, rank INTEGER,
+            UNIQUE(scan_id, endpoint_id), FOREIGN KEY(scan_id) REFERENCES scan_runs(id),
+            FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
+        CREATE TABLE IF NOT EXISTS candidate_score_reasons (
+            candidate_id TEXT NOT NULL, reason_code TEXT NOT NULL, points INTEGER NOT NULL,
+            explanation TEXT NOT NULL, PRIMARY KEY(candidate_id, reason_code),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id)
+        );
+        CREATE TABLE IF NOT EXISTS candidate_history_signals (
+            candidate_id TEXT NOT NULL, signal_code TEXT NOT NULL, explanation TEXT NOT NULL,
+            PRIMARY KEY(candidate_id, signal_code, explanation),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id)
+        );
+        CREATE TABLE IF NOT EXISTS candidate_opportunities (
+            candidate_id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
+            PRIMARY KEY(candidate_id, opportunity_id),
+            FOREIGN KEY(candidate_id) REFERENCES correlated_candidates(id),
+            FOREIGN KEY(opportunity_id) REFERENCES investigation_opportunities(id)
         );",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_endpoint_observations_scan_endpoint ON endpoint_observations(scan_id, endpoint_id);
+         CREATE INDEX IF NOT EXISTS idx_fingerprints_scan_endpoint ON response_fingerprints(scan_id, endpoint_id);
+         CREATE INDEX IF NOT EXISTS idx_opportunities_scan_endpoint ON investigation_opportunities(scan_id, endpoint_id);",
     )?;
 
     conn.execute_batch(
@@ -1349,6 +1379,95 @@ mod tests {
             0
         );
 
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn phase3_database_upgrades_to_phase4_without_losing_evidence() {
+        let path = std::env::temp_dir().join(format!("recon_phase3_{}.db", Uuid::new_v4()));
+        let scan = ScanRun::new(vec!["example.com".into()], "phase3".into());
+        let conn = init_db(path.to_str().unwrap()).unwrap();
+        save_scan_run(&conn, &scan).unwrap();
+        save_endpoint_observation(
+            &conn,
+            &scan.id,
+            "https://example.com/api/users?id=1",
+            "http_probe",
+            None,
+        )
+        .unwrap();
+        classify_scan_inventory(&conn, &scan.id).unwrap();
+        let endpoint =
+            crate::scan::normalize::normalize_endpoint("https://example.com/api/users?id=1", None)
+                .unwrap();
+        let endpoint_id = crate::scan::normalize::endpoint_id(&endpoint);
+        conn.execute(
+            "INSERT INTO hostnames VALUES ('example.com','example.com','Seed',NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO http_observations VALUES ('phase3-observation',?1,'example.com',?2,200,NULL,NULL,1,2,'now')",
+            params![scan.id.to_string(), endpoint.canonical_url],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO response_fingerprints VALUES ('phase3-observation',?1,?2,200,2,2,1,'raw','normalized',NULL,'headers',NULL,NULL,'\"fast\"')",
+            params![scan.id.to_string(), endpoint_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO investigation_opportunities VALUES ('opp',?1,?2,?3,'IdentifierHandling','fixture','[]',5,'Repeatable',NULL)",
+            params![scan.id.to_string(), endpoint_id, endpoint.canonical_url],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_attempts VALUES ('attempt',?1,'opp',1,'repeat',?2,NULL,NULL,'stable',NULL,'now')",
+            params![scan.id.to_string(), endpoint.canonical_url],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE candidate_opportunities;
+             DROP TABLE candidate_history_signals;
+             DROP TABLE candidate_score_reasons;
+             DROP TABLE correlated_candidates;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = init_db(path.to_str().unwrap()).unwrap();
+        for table in [
+            "scan_runs",
+            "endpoints",
+            "endpoint_observations",
+            "response_fingerprints",
+            "endpoint_classifications",
+            "parameter_semantics",
+            "investigation_opportunities",
+            "verification_attempts",
+        ] {
+            assert!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap()
+                    > 0,
+                "{table} was not preserved"
+            );
+        }
+        for table in [
+            "correlated_candidates",
+            "candidate_score_reasons",
+            "candidate_history_signals",
+            "candidate_opportunities",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
         drop(conn);
         std::fs::remove_file(path).unwrap();
     }
