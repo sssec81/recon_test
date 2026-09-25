@@ -277,7 +277,7 @@ pub fn generate(
             &endpoint_id,
         )?;
         let live: Option<(String, String, ResponseFingerprint)> = conn.query_row(
-            "SELECT h.url,h.id,f.status,f.body_length,f.captured_length,f.body_complete,f.raw_hash,f.normalized_hash,f.content_type,f.header_hash,f.redirect_target,f.json_shape_hash,f.timing_bucket FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id WHERE h.scan_id=?1 AND f.endpoint_id=?2 ORDER BY h.observed_at,h.id LIMIT 1",
+            "SELECT h.url,h.id,f.status,f.body_length,f.captured_length,f.body_complete,f.raw_hash,f.normalized_hash,f.content_type,f.header_hash,f.redirect_target,f.json_shape_hash,f.timing_bucket FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id WHERE h.scan_id=?1 AND f.endpoint_id=?2 AND f.body_complete=1 AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=h.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY h.observed_at,h.id LIMIT 1",
             params![scan, endpoint_id], |row| Ok((row.get(0)?, row.get(1)?, fingerprint_row(row, 2)?))).optional()?;
         let mut categories: BTreeMap<OpportunityCategory, Vec<String>> = BTreeMap::new();
         for class in &classes {

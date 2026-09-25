@@ -295,7 +295,7 @@ fn load_sets(
     })? {
         let (endpoint, source) = row?;
         if let Some(item) = map.get_mut(&endpoint) {
-            item.live |= source == "http_probe";
+            item.live |= crate::storage::db::provenance_is_live(&source);
             item.provenance.insert(source);
         }
     }
@@ -334,7 +334,7 @@ fn load_sets(
 
 fn previous_scan(conn: &Connection, current: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT prior.id FROM scan_runs current JOIN scan_runs prior ON prior.root_scope=current.root_scope WHERE current.id=?1 AND prior.id<>current.id AND prior.finished_at IS NOT NULL AND prior.started_at<current.started_at ORDER BY prior.finished_at DESC,prior.id DESC LIMIT 1",
+        "SELECT prior.id FROM scan_runs current JOIN scan_runs prior ON prior.root_scope=current.root_scope AND prior.config_hash=current.config_hash WHERE current.id=?1 AND prior.id<>current.id AND prior.finished_at IS NOT NULL AND prior.started_at<current.started_at ORDER BY prior.finished_at DESC,prior.id DESC LIMIT 1",
         params![current],
         |row| row.get(0),
     ).optional()
@@ -410,6 +410,8 @@ fn score_provenance(reasons: &mut BTreeMap<String, ScoreReason>, sources: &BTree
         ("source_map", 8, "source-map provenance"),
         ("javascript", 6, "JavaScript provenance"),
         ("http_probe", 5, "live HTTP provenance"),
+        ("triage_fetch", 5, "live triage-fetch provenance"),
+        ("verification", 5, "live verification provenance"),
     ];
     let mut awarded = 0u16;
     for (source, points, explanation) in dimensions {
@@ -1100,7 +1102,7 @@ mod tests {
     #[test]
     fn history_uses_same_scope_ignores_timing_and_detects_safe_changes() {
         let conn = db::init_db(":memory:").unwrap();
-        let mut old = ScanRun::new(vec!["example.com".into()], "old".into());
+        let mut old = ScanRun::new(vec!["example.com".into()], "same".into());
         save_run(&conn, &mut old, "2026-01-01T00:00:00Z");
         let old_id = endpoint(
             &conn,
@@ -1121,7 +1123,7 @@ mod tests {
         );
         let mut unrelated = ScanRun::new(vec!["other.com".into()], "other".into());
         save_run(&conn, &mut unrelated, "2026-01-02T00:00:00Z");
-        let mut current = ScanRun::new(vec!["example.com".into()], "new".into());
+        let mut current = ScanRun::new(vec!["example.com".into()], "same".into());
         save_run(&conn, &mut current, "2026-01-03T00:00:00Z");
         let current_id = endpoint(
             &conn,
@@ -1157,6 +1159,16 @@ mod tests {
                 && codes.contains("history:evidence_improved")
         );
         assert!(!codes.contains("history:fingerprint_changed"));
+    }
+
+    #[test]
+    fn history_rejects_materially_different_collection_configuration() {
+        let conn = db::init_db(":memory:").unwrap();
+        let mut prior = ScanRun::new(vec!["example.com".into()], "triage-disabled".into());
+        save_run(&conn, &mut prior, "2026-01-01T00:00:00Z");
+        let mut current = ScanRun::new(vec!["example.com".into()], "triage-enabled".into());
+        save_run(&conn, &mut current, "2026-01-02T00:00:00Z");
+        assert_eq!(previous_scan(&conn, &current.id.to_string()).unwrap(), None);
     }
 
     #[test]

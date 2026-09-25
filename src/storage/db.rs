@@ -2,6 +2,7 @@ use crate::storage::models::{
     DnsRecord, Hostname, HttpObservation, ScanRun, ServiceRecord, TechnologyObservation, TlsRecord,
 };
 use rusqlite::{Connection, Result, params};
+use sha2::Digest;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -217,6 +218,17 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             semantic TEXT NOT NULL, PRIMARY KEY(scan_id, endpoint_id, parameter_name),
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
         );
+        CREATE TABLE IF NOT EXISTS endpoint_request_shapes (
+            scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, method TEXT NOT NULL,
+            source TEXT NOT NULL, parameter_location TEXT NOT NULL, parameter_name TEXT NOT NULL,
+            PRIMARY KEY(scan_id,endpoint_id,method,source,parameter_location,parameter_name),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
+        CREATE TABLE IF NOT EXISTS intelligence_statuses (
+            scan_id TEXT NOT NULL, source_url TEXT NOT NULL, kind TEXT NOT NULL,
+            complete BOOLEAN NOT NULL, limitation TEXT,
+            PRIMARY KEY(scan_id,source_url,kind), FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        );
         CREATE TABLE IF NOT EXISTS investigation_opportunities (
             id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL,
             canonical_url TEXT NOT NULL, category TEXT NOT NULL, reason TEXT NOT NULL,
@@ -347,6 +359,10 @@ pub fn save_provider_status(
     Ok(())
 }
 
+pub fn provenance_is_live(source: &str) -> bool {
+    matches!(source, "http_probe" | "triage_fetch" | "verification")
+}
+
 pub fn save_endpoint_observation(
     conn: &Connection,
     scan_id: &Uuid,
@@ -360,6 +376,75 @@ pub fn save_endpoint_observation(
     let id = crate::scan::normalize::endpoint_id(&endpoint);
     conn.execute("INSERT INTO endpoints (id, scheme, host, port, path, canonical_url, first_seen_scan, last_seen_scan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(canonical_url) DO UPDATE SET last_seen_scan=excluded.last_seen_scan", params![id, endpoint.scheme, endpoint.host, endpoint.port, endpoint.path, endpoint.canonical_url, scan_id.to_string()])?;
     conn.execute("INSERT OR IGNORE INTO endpoint_observations (endpoint_id, scan_id, raw_url, source, source_reference) VALUES (?1, ?2, ?3, ?4, ?5)", params![crate::scan::normalize::endpoint_id(&endpoint), scan_id.to_string(), raw_url, source, source_reference.unwrap_or("")])?;
+    Ok(())
+}
+
+pub fn save_request_shape(
+    conn: &Connection,
+    scan_id: &Uuid,
+    raw_url: &str,
+    method: &str,
+    source: &str,
+    parameter_location: &str,
+    parameter_name: &str,
+) -> Result<()> {
+    save_endpoint_observation(conn, scan_id, raw_url, source, None)?;
+    let Some(endpoint) = crate::scan::normalize::normalize_endpoint(raw_url, None) else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO endpoint_request_shapes VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            scan_id.to_string(),
+            crate::scan::normalize::endpoint_id(&endpoint),
+            method,
+            source,
+            parameter_location,
+            parameter_name
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn save_intelligence_status(
+    conn: &Connection,
+    scan_id: &Uuid,
+    source_url: &str,
+    kind: &str,
+    complete: bool,
+    limitation: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO intelligence_statuses VALUES (?1,?2,?3,?4,?5)",
+        params![scan_id.to_string(), source_url, kind, complete, limitation],
+    )?;
+    Ok(())
+}
+
+pub fn save_active_http_observation(
+    conn: &Connection,
+    scan_id: &Uuid,
+    raw_url: &str,
+    source: &str,
+    status: u16,
+    elapsed_ms: u64,
+    fingerprint: &crate::scan::fingerprint::ResponseFingerprint,
+) -> Result<()> {
+    save_endpoint_observation(conn, scan_id, raw_url, source, None)?;
+    let Some(endpoint) = crate::scan::normalize::normalize_endpoint(raw_url, None) else {
+        return Ok(());
+    };
+    let endpoint_id = crate::scan::normalize::endpoint_id(&endpoint);
+    let observation_id = format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{scan_id}:{source}:{raw_url}").as_bytes())
+    );
+    conn.execute(
+        "INSERT OR IGNORE INTO hostnames (id,name,source,discovered_from) VALUES (?1,?1,'HtmlLink',NULL)",
+        params![endpoint.host],
+    )?;
+    conn.execute("INSERT OR REPLACE INTO http_observations (id,scan_id,hostname,url,status_code,title,server_header,rtt_ms,content_length,observed_at) VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8)", params![observation_id,scan_id.to_string(),endpoint.host,raw_url,status,elapsed_ms as i64,fingerprint.body_length as i64,chrono::Utc::now().to_rfc3339()])?;
+    conn.execute("INSERT OR REPLACE INTO response_fingerprints VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![observation_id,scan_id.to_string(),endpoint_id,fingerprint.status,fingerprint.body_length as i64,fingerprint.captured_length as i64,fingerprint.body_complete,fingerprint.raw_hash,fingerprint.normalized_hash,fingerprint.content_type,fingerprint.header_hash,fingerprint.redirect_target,fingerprint.json_shape_hash,serde_json::to_string(&fingerprint.timing_bucket).unwrap_or_default()])?;
     Ok(())
 }
 
@@ -439,10 +524,38 @@ pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> 
                 parameters.extend(url.query_pairs().map(|(name, _)| name.into_owned()));
             }
         }
+        {
+            let mut statement = tx.prepare("SELECT parameter_name FROM endpoint_request_shapes WHERE scan_id=?1 AND endpoint_id=?2 AND parameter_name<>'' ORDER BY parameter_name")?;
+            parameters.extend(
+                statement
+                    .query_map(params![scan_id, endpoint_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        let path_parameter = reqwest::Url::parse(&canonical_url).ok().and_then(|url| {
+            url.path_segments()?.find_map(|segment| {
+                if !segment.is_empty() && segment.chars().all(|value| value.is_ascii_digit()) {
+                    Some("path_id")
+                } else if uuid::Uuid::parse_str(segment).is_ok() {
+                    Some("path_uuid")
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(name) = path_parameter {
+            parameters.insert(name.to_string());
+            tx.execute("INSERT OR IGNORE INTO endpoint_request_shapes VALUES (?1,?2,'GET','path_classifier','path',?3)",params![scan_id,endpoint_id,name])?;
+        }
         for name in parameters {
+            let semantic = if matches!(name.as_str(), "path_id" | "path_uuid") {
+                "ObjectId".to_string()
+            } else {
+                crate::scan::classify::parameter_semantic(&name).to_string()
+            };
             tx.execute(
                 "INSERT INTO parameter_semantics (scan_id, endpoint_id, parameter_name, semantic) VALUES (?1, ?2, ?3, ?4)",
-                params![scan_id, endpoint_id, name, crate::scan::classify::parameter_semantic(&name)],
+                params![scan_id, endpoint_id, name, semantic],
             )?;
         }
     }
@@ -1011,6 +1124,14 @@ mod tests {
             1
         );
         conn.query_row("SELECT count(*) FROM provider_statuses", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        conn.query_row("SELECT count(*) FROM endpoint_request_shapes", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        conn.query_row("SELECT count(*) FROM intelligence_statuses", [], |r| {
             r.get::<_, i64>(0)
         })
         .unwrap();

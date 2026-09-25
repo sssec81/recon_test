@@ -27,6 +27,7 @@ pub struct HttpEvidence {
     pub body_excerpt: Option<String>,
     pub elapsed_ms: u64,
     pub error: Option<String>,
+    pub fingerprint: Option<crate::scan::fingerprint::ResponseFingerprint>,
 }
 
 pub struct Page {

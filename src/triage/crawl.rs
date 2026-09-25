@@ -5,7 +5,6 @@ use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Url;
 use scraper::{Html, Selector};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -57,62 +56,75 @@ impl<'a> FetchBudget<'a> {
             return None;
         }
         let started = Instant::now();
-        let mut current = url.clone();
-        let mut redirects = 0;
-        let response = loop {
-            if self.requests > 0 && !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+        if self.requests > 0 && !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.requests += 1;
+        let scheduled = match self.client.get_with_trace(url).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Some(Page {
+                    evidence: HttpEvidence {
+                        requested_url: url.to_string(),
+                        final_url: None,
+                        status: None,
+                        content_type: None,
+                        bytes: 0,
+                        body_sha256: None,
+                        title: None,
+                        body_excerpt: None,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        error: Some(error.to_string()),
+                        fingerprint: None,
+                    },
+                    body: String::new(),
+                });
             }
-            if self.exhausted() {
-                return None;
-            }
-            self.requests += 1;
-            let response = match self.client.get(&current).await {
-                Ok(response) => response,
-                Err(error) => {
-                    return Some(Page {
-                        evidence: HttpEvidence {
-                            requested_url: url.to_string(),
-                            final_url: Some(current.to_string()),
-                            status: None,
-                            content_type: None,
-                            bytes: 0,
-                            body_sha256: None,
-                            title: None,
-                            body_excerpt: None,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                            error: Some(error.to_string()),
-                        },
-                        body: String::new(),
-                    });
-                }
-            };
-            let redirect_url = if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
-            {
-                response
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| current.join(value).ok())
-            } else {
-                None
-            };
-            if let Some(next) = redirect_url
-                && redirects < 5
-                && !self.exhausted()
-                && is_safe_url(&next, self.scope)
-            {
-                current = next;
-                redirects += 1;
-                continue;
-            }
-            break response;
         };
+        if scheduled.termination != crate::scan::network::RedirectTermination::FinalResponse {
+            let redirect_detail = scheduled
+                .blocked_destination
+                .as_deref()
+                .map(|destination| format!(" blocked={destination}"))
+                .unwrap_or_default();
+            let safe_initial =
+                crate::scan::normalize::normalize_endpoint(scheduled.initial_url.as_str(), None)
+                    .map(|endpoint| endpoint.canonical_url)
+                    .unwrap_or_else(|| "invalid-endpoint".into());
+            return Some(Page {
+                evidence: HttpEvidence {
+                    requested_url: url.to_string(),
+                    final_url: None,
+                    status: scheduled.last_status,
+                    content_type: None,
+                    bytes: 0,
+                    body_sha256: None,
+                    title: None,
+                    body_excerpt: None,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    error: Some(
+                        format!(
+                            "redirect_{:?} initial={} hops={}{}",
+                            scheduled.termination,
+                            safe_initial,
+                            scheduled.redirect_hops,
+                            redirect_detail
+                        )
+                        .to_ascii_lowercase(),
+                    ),
+                    fingerprint: None,
+                },
+                body: String::new(),
+            });
+        }
+        let response = scheduled.response.expect("final scheduler response");
         let final_url = response.url().clone();
         if !self.scope.allows_redirect_url(&final_url) {
             return None;
         }
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let declared_length = response.content_length().map(|value| value as usize);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -121,12 +133,14 @@ impl<'a> FetchBudget<'a> {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         let mut stream_error = None;
+        let mut truncated = false;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
                     let remaining = MAX_BODY_BYTES.saturating_sub(bytes.len());
                     bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                    if bytes.len() == MAX_BODY_BYTES {
+                    if chunk.len() > remaining {
+                        truncated = true;
                         break;
                     }
                 }
@@ -137,6 +151,24 @@ impl<'a> FetchBudget<'a> {
             }
         }
         let body = String::from_utf8_lossy(&bytes).to_string();
+        let body_complete = stream_error.is_none()
+            && !truncated
+            && declared_length.is_none_or(|length| length <= bytes.len());
+        let mut response_fingerprint = crate::scan::fingerprint::fingerprint(
+            status,
+            &bytes,
+            declared_length.unwrap_or(bytes.len()),
+            body_complete,
+            content_type.as_deref(),
+            &headers,
+            Some(started.elapsed().as_millis() as u64),
+        );
+        response_fingerprint.redirect_target = response_fingerprint
+            .redirect_target
+            .as_deref()
+            .and_then(|value| final_url.join(value).ok())
+            .and_then(|url| crate::scan::normalize::normalize_endpoint(url.as_str(), None))
+            .map(|endpoint| endpoint.canonical_url);
         let title = if is_html(&content_type) {
             let document = Html::parse_document(&body);
             Selector::parse("title")
@@ -163,11 +195,12 @@ impl<'a> FetchBudget<'a> {
                 status: Some(status),
                 content_type,
                 bytes: bytes.len(),
-                body_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+                body_sha256: Some(response_fingerprint.raw_hash.clone()),
                 title,
                 body_excerpt,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 error: stream_error,
+                fingerprint: Some(response_fingerprint),
             },
             body,
         })
@@ -334,7 +367,7 @@ mod tests {
         let page = Page {
             evidence: HttpEvidence { requested_url: base.to_string(), final_url: None, status: Some(200),
                 content_type: Some("text/html".into()), bytes: 0, body_sha256: None, title: None,
-                body_excerpt: None, elapsed_ms: 0, error: None },
+                body_excerpt: None, elapsed_ms: 0, error: None, fingerprint: None },
             body: r#"<a href="/api/user?id=42">user</a><a href="https://outside.test/">out</a><a href="/logout">logout</a>"#.into(),
         };
         let links = extract_links(&page, &base, &scope);
@@ -359,6 +392,7 @@ mod tests {
                 body_excerpt: None,
                 elapsed_ms: 0,
                 error: None,
+                fingerprint: None,
             },
             body: body.into(),
         };

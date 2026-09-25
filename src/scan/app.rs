@@ -90,11 +90,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     seed_hosts.sort();
     seed_hosts.dedup();
     let config = format!(
-        "v2;passive={};scheme={:?};ports={:?};seeds={:?}",
+        "v3;passive={};scheme={:?};ports={:?};seeds={:?};triage={};triage_depth={};triage_pages={};triage_requests={};verification={}",
         args.passive,
         args.scheme_strategy,
         crate::probes::services::DEFAULT_PORTS,
-        seed_hosts
+        seed_hosts,
+        args.triage,
+        args.triage_max_depth,
+        args.triage_max_pages,
+        args.triage_max_requests,
+        args.controlled_verification
     );
     let config_hash = format!("{:x}", Sha256::digest(config.as_bytes()));
 
@@ -331,12 +336,21 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Mark the run complete after all observation bundles are written.
-    scan_run.complete();
-    db::finish_scan_run(&conn, &scan_run.id)?;
+    if args.triage {
+        let observations = db::get_scan_observations(&conn, &scan_run.id)?;
+        triage::run(
+            scan_context.target_http.as_ref(),
+            &scan_context.scope,
+            &observations,
+            TriageConfig::from(&args),
+            scan_run.id,
+            Some(&conn),
+        )
+        .await?;
+    }
 
-    println!("🎉 ScanRun {} completed successfully!", scan_run.id);
-
+    // Discovery is complete. Rebuild all deterministic semantics before any
+    // controlled verification so triage/JS/source-map evidence participates.
     db::classify_scan_inventory(&conn, &scan_run.id)?;
     if args.controlled_verification {
         crate::verification::run(
@@ -352,19 +366,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
 
-    if args.triage {
-        let observations = db::get_scan_observations(&conn, &scan_run.id)?;
-        triage::run(
-            scan_context.target_http.as_ref(),
-            &scan_context.scope,
-            &observations,
-            TriageConfig::from(&args),
-            scan_run.id,
-            Some(&conn),
-        )
-        .await?;
-    }
-
     crate::correlation::run(
         &conn,
         scan_run.id,
@@ -375,6 +376,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     crate::review::generate(&conn, scan_run.id, std::path::Path::new(&args.triage_dir))?;
+
+    // A non-null finish time means every deterministic stage succeeded and the
+    // scan is eligible as a historical baseline. Optional AI remains nonfatal.
+    scan_run.complete();
+    db::finish_scan_run(&conn, &scan_run.id)?;
+    println!("🎉 ScanRun {} completed successfully!", scan_run.id);
 
     if args.ai_analyze {
         let provider = match args.llm_backend {

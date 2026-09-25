@@ -125,6 +125,8 @@ cargo run --release -- -t example.com --scope example.com --passive false --tria
 
 Triage starts after recon. It follows in-scope GET links and scripts, skips common state-changing paths, and does not submit forms. Triage retains its own `--triage-max-requests` crawl/verification limit. In addition, reconnaissance, triage, and verification share a target-HTTP scheduler with scope checks, global and per-host pacing, concurrency limits, deadlines, and a total ceiling of `max-targets × 8 + triage-max-requests` requests. Output is saved under `triage_output/<scan-id>/review.md`, `review.json`, `endpoints.json`, `anomalies.json`, `suppressed.json`, and `evidence/`. The endpoint inventory records route templates, query and form field names, discovery sources, observed statuses, and content types. `suppressed.json` records candidates rejected by repeat or control checks, budget limits, and the review queue cap. Review packages contain response metadata, a short text excerpt, and a body hash. They do not contain full response bodies. Treat local evidence as potentially sensitive.
 
+Deep discovery now completes before deterministic classification and controlled verification. Triage links, JavaScript/source-map discoveries, form methods, parameter locations, and actually fetched responses feed the scan-scoped SQLite inventory in the same run. Triage fetches use the same response-fingerprint implementation as initial probes and count as confirmed-live evidence only when a complete active response was retained. The shared scheduler remains the sole owner of redirect following and request accounting.
+
 Triage also rechecks initial web endpoints that returned a server error, so a detailed error page at the scan entry point can enter the review queue.
 
 ### Run controlled verification
@@ -134,6 +136,8 @@ cargo run --release -- -t example.com --scope example.com --controlled-verificat
 ```
 
 Phase 3 deterministically narrows endpoint classifications, parameter semantics, fingerprints, and provenance into investigation opportunities. Only confirmed-live, complete GET baselines are eligible. An eligible opportunity receives one repeat and, for redirect/search semantics, at most one same-origin inert control. Every request uses the shared scheduler and its scope, redirect, pacing, concurrency, deadline, and request-budget controls. Results and suppression reasons are stored in `investigation_opportunities` and `verification_attempts`; console output explicitly remains a manual-review candidate and does not create vulnerability findings. Request URLs have values redacted, and persisted fingerprints redact redirect targets.
+
+Phase 7 is a pipeline and evidence repair, not a new payload engine. It adds no aggressive vulnerability payloads, form submission, arbitrary non-GET execution, identifier enumeration, or automatic vulnerability confirmation.
 
 ### Deterministic candidate ranking
 

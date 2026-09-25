@@ -15,6 +15,15 @@ pub struct ScanResult {
 
 const MAX_RESPONSE_BYTES: usize = 128 * 1024; // 128 KB limit
 
+fn capture_is_complete(
+    declared_length: Option<usize>,
+    captured_length: usize,
+    truncated: bool,
+    stream_error: bool,
+) -> bool {
+    !stream_error && !truncated && declared_length.is_none_or(|length| length <= captured_length)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SchemeStrategy {
     HttpsFirst,
@@ -59,23 +68,31 @@ pub async fn probe_single_url(client: &RequestScheduler, url: &str) -> Option<Sc
     // Stream response body up to MAX_RESPONSE_BYTES
     let mut body_bytes = Vec::new();
     let mut stream = response.bytes_stream();
+    let mut truncated = false;
+    let mut stream_error = false;
 
     while let Some(chunk_res) = stream.next().await {
-        if let Ok(chunk) = chunk_res {
-            let space_left = MAX_RESPONSE_BYTES.saturating_sub(body_bytes.len());
-            if space_left == 0 {
+        match chunk_res {
+            Ok(chunk) => {
+                let space_left = MAX_RESPONSE_BYTES.saturating_sub(body_bytes.len());
+                let to_take = chunk.len().min(space_left);
+                body_bytes.extend_from_slice(&chunk[..to_take]);
+                if chunk.len() > space_left {
+                    truncated = true;
+                    break;
+                }
+            }
+            Err(_) => {
+                stream_error = true;
                 break;
             }
-            let to_take = chunk.len().min(space_left);
-            body_bytes.extend_from_slice(&chunk[..to_take]);
-        } else {
-            break;
         }
     }
 
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
     let title = extract_title(&body_str);
-    let body_complete = declared_length.is_none_or(|length| length <= body_bytes.len());
+    let body_complete =
+        capture_is_complete(declared_length, body_bytes.len(), truncated, stream_error);
     let fingerprint = Some(fingerprint::fingerprint(
         status_code,
         &body_bytes,
@@ -167,6 +184,16 @@ mod tests {
             extract_title("<html><body>İ</body><title>Unicode ✓</title></html>"),
             Some("Unicode ✓".to_string())
         );
+    }
+
+    #[test]
+    fn response_completeness_matrix_handles_declared_chunked_truncation_and_errors() {
+        assert!(capture_is_complete(Some(5), 5, false, false));
+        assert!(capture_is_complete(Some(3), 3, false, false));
+        assert!(!capture_is_complete(Some(10), 5, true, false));
+        assert!(capture_is_complete(None, 5, false, false));
+        assert!(!capture_is_complete(None, MAX_RESPONSE_BYTES, true, false));
+        assert!(!capture_is_complete(None, 5, false, true));
     }
 
     #[tokio::test]

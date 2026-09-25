@@ -228,7 +228,7 @@ fn load_summary(
     let scope = serde_json::to_string(&scan.root_scope).unwrap_or_default();
     let previous = conn
         .query_row(
-            "SELECT 1 FROM scan_runs WHERE id<>?1 AND root_scope=?2 AND finished_at IS NOT NULL AND started_at<?3 LIMIT 1",
+            "SELECT 1 FROM scan_runs WHERE id<>?1 AND root_scope=?2 AND config_hash=(SELECT config_hash FROM scan_runs WHERE id=?1) AND finished_at IS NOT NULL AND started_at<?3 LIMIT 1",
             params![id, scope, scan.started_at],
             |_| Ok(true),
         )
@@ -239,10 +239,10 @@ fn load_summary(
             "SELECT count(DISTINCT endpoint_id) FROM endpoint_observations WHERE scan_id=?1",
         )?,
         live_endpoints: count(
-            "SELECT count(DISTINCT endpoint_id) FROM endpoint_observations WHERE scan_id=?1 AND source='http_probe'",
+            "SELECT count(DISTINCT endpoint_id) FROM endpoint_observations WHERE scan_id=?1 AND source IN ('http_probe','triage_fetch','verification')",
         )?,
         historical_only_endpoints: count(
-            "SELECT count(DISTINCT o.endpoint_id) FROM endpoint_observations o WHERE o.scan_id=?1 AND lower(o.source) IN ('historical','wayback','common_crawl','commoncrawl') AND NOT EXISTS (SELECT 1 FROM endpoint_observations live WHERE live.scan_id=o.scan_id AND live.endpoint_id=o.endpoint_id AND live.source='http_probe')",
+            "SELECT count(DISTINCT o.endpoint_id) FROM endpoint_observations o WHERE o.scan_id=?1 AND lower(o.source) IN ('historical','wayback','common_crawl','commoncrawl') AND NOT EXISTS (SELECT 1 FROM endpoint_observations live WHERE live.scan_id=o.scan_id AND live.endpoint_id=o.endpoint_id AND live.source IN ('http_probe','triage_fetch','verification'))",
         )?,
         javascript_derived_endpoints: count(
             "SELECT count(DISTINCT endpoint_id) FROM endpoint_observations WHERE scan_id=?1 AND source='javascript'",
@@ -662,7 +662,7 @@ fn provenance_review(source: String) -> ProvenanceReview {
         _ => "retained inventory provenance",
     };
     ProvenanceReview {
-        confirms_live: source == "http_probe",
+        confirms_live: crate::storage::db::provenance_is_live(&source),
         source: safe_identifier(&source),
         explanation: explanation.into(),
     }

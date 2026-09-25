@@ -125,8 +125,44 @@ pub async fn run(
             .and_then(|value| Url::parse(value).ok())
             .unwrap_or_else(|| url.clone());
         if let Some(conn) = conn
+            && let (Some(status), Some(fingerprint)) =
+                (page.evidence.status, page.evidence.fingerprint.as_ref())
+        {
+            db::save_active_http_observation(
+                conn,
+                &scan_id,
+                response_url.as_str(),
+                "triage_fetch",
+                status,
+                page.evidence.elapsed_ms,
+                fingerprint,
+            )?;
+        }
+        if let Some(conn) = conn
             && let Some(script) = script_text(&page)
         {
+            if page
+                .evidence
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value.contains("javascript"))
+            {
+                let complete = page
+                    .evidence
+                    .fingerprint
+                    .as_ref()
+                    .is_some_and(|value| value.body_complete);
+                db::save_intelligence_status(
+                    conn,
+                    &scan_id,
+                    response_url.as_str(),
+                    "source_map_discovery",
+                    complete,
+                    (!complete).then_some(
+                        "JavaScript capture was truncated; source-map discovery may be incomplete",
+                    ),
+                )?;
+            }
             for candidate in crate::scan::javascript::extract(&script, &response_url, scope) {
                 db::save_javascript_observation(
                     conn,
@@ -144,26 +180,42 @@ pub async fn run(
                 && let Some(map_url) = crate::scan::sourcemap::map_candidate(&response_url, &script)
                 && scope.allows_redirect_url(&map_url)
                 && let Some(map_page) = budget.fetch(&map_url).await
-                && let Some(map) = crate::scan::sourcemap::parse(&map_page.body)
             {
-                for source_file in &map.source_files {
-                    db::save_source_map_observation(
+                if let (Some(status), Some(fingerprint)) = (
+                    map_page.evidence.status,
+                    map_page.evidence.fingerprint.as_ref(),
+                ) {
+                    db::save_active_http_observation(
                         conn,
                         &scan_id,
-                        response_url.as_str(),
                         map_url.as_str(),
-                        source_file,
+                        "triage_fetch",
+                        status,
+                        map_page.evidence.elapsed_ms,
+                        fingerprint,
                     )?;
                 }
-                for source in map.source_contents {
-                    for candidate in crate::scan::javascript::extract(&source, &map_url, scope) {
-                        db::save_javascript_observation(
+                if let Some(map) = crate::scan::sourcemap::parse(&map_page.body) {
+                    for source_file in &map.source_files {
+                        db::save_source_map_observation(
                             conn,
                             &scan_id,
+                            response_url.as_str(),
                             map_url.as_str(),
-                            "source_map",
-                            &candidate,
+                            source_file,
                         )?;
+                    }
+                    for source in map.source_contents {
+                        for candidate in crate::scan::javascript::extract(&source, &map_url, scope)
+                        {
+                            db::save_javascript_observation(
+                                conn,
+                                &scan_id,
+                                map_url.as_str(),
+                                "source_map",
+                                &candidate,
+                            )?;
+                        }
                     }
                 }
             }
@@ -195,6 +247,24 @@ pub async fn run(
                 .and_then(|value| Url::parse(value).ok())
                 .unwrap_or(url);
             for link in extract_links(&page, &base, scope) {
+                if let Some(conn) = conn {
+                    db::save_endpoint_observation(
+                        conn,
+                        &scan_id,
+                        link.as_str(),
+                        if page
+                            .evidence
+                            .content_type
+                            .as_deref()
+                            .is_some_and(|value| value.contains("javascript"))
+                        {
+                            "triage_script"
+                        } else {
+                            "triage_link"
+                        },
+                        Some(base.as_str()),
+                    )?;
+                }
                 if seen_urls.insert(link.to_string()) {
                     queue.push_back((link, depth + 1));
                 }
@@ -257,6 +327,44 @@ pub async fn run(
         .await;
     }
     let candidates_found = seen_candidates.len() + anomaly_failures;
+    if let Some(conn) = conn {
+        for endpoint in inventory.endpoints() {
+            let source = endpoint
+                .sources
+                .iter()
+                .next()
+                .map(String::as_str)
+                .unwrap_or("triage_link");
+            if endpoint.parameters.is_empty() {
+                db::save_request_shape(
+                    conn,
+                    &scan_id,
+                    &endpoint.url_template,
+                    &endpoint.method,
+                    source,
+                    "unknown",
+                    "",
+                )?;
+            } else {
+                let location = if endpoint.method == "GET" {
+                    "query"
+                } else {
+                    "form"
+                };
+                for parameter in &endpoint.parameters {
+                    db::save_request_shape(
+                        conn,
+                        &scan_id,
+                        &endpoint.url_template,
+                        &endpoint.method,
+                        source,
+                        location,
+                        parameter,
+                    )?;
+                }
+            }
+        }
+    }
     verified.sort_by(|a, b| {
         b.confidence
             .cmp(&a.confidence)
@@ -347,6 +455,139 @@ mod tests {
         assert!(triage.fetch(&url).await.is_some()); // verification/control request path
         assert!(scheduler.get(&url).await.is_err()); // rejected before a fourth network request
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deep_javascript_discovery_reaches_classification_verification_and_correlation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 2048];
+                    let count = socket.read(&mut request).await.unwrap_or(0);
+                    let first = String::from_utf8_lossy(&request[..count])
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    recorded.lock().unwrap().push(first.clone());
+                    let path = first.split_whitespace().nth(1).unwrap_or("/");
+                    let (content_type, body) = if path == "/" {
+                        ("text/html", "<script src=\"/app.js\"></script>")
+                    } else if path == "/app.js" {
+                        ("application/javascript", "fetch('/api/search?q=test');")
+                    } else {
+                        ("application/json", "{\"results\":[]}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let scheduler = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            1,
+            20,
+            0,
+            0,
+            None,
+        );
+        let conn = db::init_db(":memory:").unwrap();
+        let scan = ScanRun::new(vec!["127.0.0.1".into()], "pipeline".into());
+        db::save_scan_run(&conn, &scan).unwrap();
+        conn.execute(
+            "INSERT INTO hostnames VALUES ('127.0.0.1','127.0.0.1','Seed',NULL)",
+            [],
+        )
+        .unwrap();
+        let root = format!("http://{address}/");
+        let search = format!("http://{address}/api/search?q=test");
+        db::save_endpoint_observation(&conn, &scan.id, &root, "http_probe", None).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM endpoints WHERE canonical_url LIKE '%/api/search'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let mut observation = HttpObservation::new(scan.id, "127.0.0.1".into(), root.clone());
+        observation.status_code = Some(200);
+        let dir = std::env::temp_dir().join(format!("phase7_{}", scan.id));
+        run(
+            &scheduler,
+            &scope,
+            &[observation],
+            TriageConfig {
+                max_pages: 10,
+                max_depth: 3,
+                max_requests: 20,
+                max_minutes: 1,
+                max_findings: 5,
+                delay_ms: 0,
+                output_dir: dir.clone(),
+            },
+            scan.id,
+            Some(&conn),
+        )
+        .await
+        .unwrap();
+        db::classify_scan_inventory(&conn, &scan.id).unwrap();
+        let endpoint_id = crate::scan::normalize::endpoint_id(
+            &crate::scan::normalize::normalize_endpoint(&search, None).unwrap(),
+        );
+        assert_eq!(conn.query_row("SELECT semantic FROM parameter_semantics WHERE scan_id=?1 AND endpoint_id=?2 AND parameter_name='q'",rusqlite::params![scan.id.to_string(),endpoint_id],|row|row.get::<_,String>(0)).unwrap(),"Search");
+        assert!(conn.query_row("SELECT count(*) FROM response_fingerprints WHERE scan_id=?1 AND endpoint_id=?2 AND body_complete=1",rusqlite::params![scan.id.to_string(),endpoint_id],|row|row.get::<_,i64>(0)).unwrap()>0);
+        assert!(
+            crate::verification::generate(&conn, scan.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.endpoint_id == endpoint_id
+                    && item.evidence_state == crate::verification::EvidenceState::Observed)
+        );
+        crate::correlation::run(
+            &conn,
+            scan.id,
+            crate::correlation::ReviewConfig {
+                max_candidates: 10,
+                min_score: 0,
+                output_dir: dir.clone(),
+            },
+        )
+        .unwrap();
+        let row:(String,Option<String>)=conn.query_row("SELECT provenance,suppression_reason FROM correlated_candidates WHERE endpoint_id=?1",rusqlite::params![endpoint_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert!(row.0.contains("triage_fetch"));
+        assert_ne!(
+            row.1.as_deref(),
+            Some("passive-only endpoint without confirmed-live evidence")
+        );
+        let calls = requests.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|line| line.contains("/api/search?q=test"))
+                .count(),
+            1
+        );
+        drop(calls);
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

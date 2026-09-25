@@ -110,6 +110,24 @@ pub enum RequestError {
     RedirectLoop,
     MissingLocation,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectTermination {
+    FinalResponse,
+    OutOfScope,
+    RedirectLoop,
+    RedirectLimit,
+    MissingLocation,
+}
+
+pub struct ScheduledResponse {
+    pub response: Option<Response>,
+    pub initial_url: Url,
+    pub last_status: Option<u16>,
+    pub redirect_hops: usize,
+    pub blocked_destination: Option<String>,
+    pub termination: RedirectTermination,
+}
 impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -162,29 +180,89 @@ impl RequestScheduler {
         &self,
         url: &Url,
     ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+        let result = self.get_with_trace(url).await?;
+        match (result.response, result.termination) {
+            (Some(response), RedirectTermination::FinalResponse) => Ok(response),
+            (_, RedirectTermination::OutOfScope) => Err(RequestError::OutOfScope.into()),
+            (_, RedirectTermination::RedirectLoop) => Err(RequestError::RedirectLoop.into()),
+            (_, RedirectTermination::RedirectLimit) => Err(RequestError::RedirectLimit.into()),
+            (_, RedirectTermination::MissingLocation) => Err(RequestError::MissingLocation.into()),
+            _ => Err(RequestError::Closed.into()),
+        }
+    }
+
+    pub async fn get_with_trace(
+        &self,
+        url: &Url,
+    ) -> Result<ScheduledResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut current_url = url.clone();
         let mut visited = HashSet::new();
+        let mut hops = 0;
         for _ in 0..=5 {
             if !visited.insert(current_url.to_string()) {
-                return Err(RequestError::RedirectLoop.into());
+                return Ok(ScheduledResponse {
+                    response: None,
+                    initial_url: url.clone(),
+                    last_status: None,
+                    redirect_hops: hops,
+                    blocked_destination: None,
+                    termination: RedirectTermination::RedirectLoop,
+                });
             }
             let response = self.get_one(&current_url).await?;
             if !response.status().is_redirection() {
-                return Ok(response);
+                let status = response.status().as_u16();
+                return Ok(ScheduledResponse {
+                    response: Some(response),
+                    initial_url: url.clone(),
+                    last_status: Some(status),
+                    redirect_hops: hops,
+                    blocked_destination: None,
+                    termination: RedirectTermination::FinalResponse,
+                });
             }
+            let status = response.status().as_u16();
             let next = response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| current_url.join(value).ok())
-                .ok_or(RequestError::MissingLocation)?;
+                .ok_or(RequestError::MissingLocation);
+            let Ok(next) = next else {
+                return Ok(ScheduledResponse {
+                    response: Some(response),
+                    initial_url: url.clone(),
+                    last_status: Some(status),
+                    redirect_hops: hops,
+                    blocked_destination: None,
+                    termination: RedirectTermination::MissingLocation,
+                });
+            };
             drop(response);
             if !self.scope.allows_redirect_url(&next) {
-                return Err(RequestError::OutOfScope.into());
+                let blocked_destination =
+                    crate::scan::normalize::normalize_endpoint(next.as_str(), None)
+                        .map(|endpoint| endpoint.canonical_url);
+                return Ok(ScheduledResponse {
+                    response: None,
+                    initial_url: url.clone(),
+                    last_status: Some(status),
+                    redirect_hops: hops + 1,
+                    blocked_destination,
+                    termination: RedirectTermination::OutOfScope,
+                });
             }
             current_url = next;
+            hops += 1;
         }
-        Err(RequestError::RedirectLimit.into())
+        Ok(ScheduledResponse {
+            response: None,
+            initial_url: url.clone(),
+            last_status: None,
+            redirect_hops: hops,
+            blocked_destination: None,
+            termination: RedirectTermination::RedirectLimit,
+        })
     }
 
     async fn get_one(
@@ -364,6 +442,54 @@ mod tests {
         let started = Instant::now();
         s.pace(&url).await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn redirect_trace_preserves_blocked_evidence_without_contact_or_double_follow() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let contacted = Arc::new(AtomicUsize::new(0));
+        let count = contacted.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 512];
+                let size = socket.read(&mut request).await.unwrap();
+                let path = String::from_utf8_lossy(&request[..size]);
+                let response = if path.contains("GET /start ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /middle\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 302 Found\r\nLocation: https://outside.invalid/final?token=secret\r\nContent-Length: 0\r\n\r\n"
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let scheduler = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            ScopePolicy::new(vec!["127.0.0.1".into()]),
+            1,
+            3,
+            0,
+            0,
+            None,
+        );
+        let start: Url = format!("http://{address}/start").parse().unwrap();
+        let traced = scheduler.get_with_trace(&start).await.unwrap();
+        assert_eq!(traced.initial_url, start);
+        assert_eq!(traced.last_status, Some(302));
+        assert_eq!(traced.redirect_hops, 2);
+        assert_eq!(traced.termination, RedirectTermination::OutOfScope);
+        assert_eq!(
+            traced.blocked_destination.as_deref(),
+            Some("https://outside.invalid/final")
+        );
+        assert_eq!(contacted.load(Ordering::SeqCst), 2);
+        assert_eq!(scheduler.remaining.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]

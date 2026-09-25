@@ -70,7 +70,7 @@ impl Inventory {
     }
 
     pub fn record_page(&mut self, url: &Url, page: &Page, scope: &ScopePolicy) {
-        self.record(url, "GET", "fetched", std::iter::empty());
+        self.record(url, "GET", "triage_fetch", std::iter::empty());
         let key = format!("GET {}", route_template(url));
         if let Some(endpoint) = self.endpoints.get_mut(&key) {
             if let Some(status) = page.evidence.status {
@@ -201,6 +201,7 @@ mod tests {
                 body_excerpt: None,
                 elapsed_ms: 0,
                 error: None,
+                fingerprint: None,
             },
             body: body.into(),
         }

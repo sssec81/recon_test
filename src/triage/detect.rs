@@ -297,6 +297,7 @@ mod tests {
                 body_excerpt: None,
                 elapsed_ms: 1,
                 error: None,
+                fingerprint: None,
             },
             body: body.into(),
         }
@@ -356,6 +357,7 @@ mod tests {
             body_excerpt: None,
             elapsed_ms: 1,
             error: None,
+            fingerprint: None,
         };
         let control = HttpEvidence {
             requested_url: control_url.clone(),
