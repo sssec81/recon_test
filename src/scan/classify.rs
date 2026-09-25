@@ -50,11 +50,9 @@ pub fn endpoint_classes(canonical_url: &str) -> BTreeSet<&'static str> {
     let Ok(url) = reqwest::Url::parse(canonical_url) else {
         return BTreeSet::from(["Unknown"]);
     };
-    let mut tokens = BTreeSet::new();
-    if let Some(host) = url.host_str() {
-        tokens.extend(words(host));
-    }
-    tokens.extend(words(url.path()));
+    // Endpoint classes describe route structure. Do not split prose-like slugs
+    // (`how-to-use-sso`, `zip-download`) into security-significant words.
+    let tokens: BTreeSet<String> = path_segments(&url).collect();
 
     let mut tags = BTreeSet::new();
     add(
@@ -228,11 +226,97 @@ pub fn parameter_semantic(name: &str) -> &'static str {
     semantic
 }
 
-fn words(value: &str) -> impl Iterator<Item = String> + '_ {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
+fn path_segments(url: &reqwest::Url) -> impl Iterator<Item = String> + '_ {
+    url.path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
         .map(str::to_ascii_lowercase)
+}
+
+/// Public documentation and editorial routes need stronger evidence than
+/// words embedded in their titles before they become security opportunities.
+pub fn is_content_route(canonical_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(canonical_url) else {
+        return false;
+    };
+    path_segments(&url).any(|segment| {
+        matches!(
+            segment.as_str(),
+            "article"
+                | "articles"
+                | "blog"
+                | "blogs"
+                | "category"
+                | "categories"
+                | "docs"
+                | "documentation"
+                | "help"
+                | "hc"
+                | "kb"
+                | "news"
+                | "section"
+                | "sections"
+                | "support"
+        )
+    })
+}
+
+/// Infer a path identifier only when it follows a resource collection with
+/// clear application meaning. Numeric CMS/category/article IDs are content,
+/// not authorization evidence.
+pub fn path_identifier_name(canonical_url: &str) -> Option<&'static str> {
+    if is_content_route(canonical_url) {
+        return None;
+    }
+    let url = reqwest::Url::parse(canonical_url).ok()?;
+    let segments: Vec<String> = path_segments(&url).collect();
+    for pair in segments.windows(2) {
+        let resource = pair[0].as_str();
+        let value = pair[1].as_str();
+        let meaningful_resource = matches!(
+            resource,
+            "account"
+                | "accounts"
+                | "customer"
+                | "customers"
+                | "document"
+                | "documents"
+                | "file"
+                | "files"
+                | "invoice"
+                | "invoices"
+                | "item"
+                | "items"
+                | "member"
+                | "members"
+                | "object"
+                | "objects"
+                | "order"
+                | "orders"
+                | "organization"
+                | "organizations"
+                | "payment"
+                | "payments"
+                | "project"
+                | "projects"
+                | "resource"
+                | "resources"
+                | "tenant"
+                | "tenants"
+                | "user"
+                | "users"
+        );
+        if meaningful_resource {
+            if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+                return Some("path_id");
+            }
+            if uuid::Uuid::parse_str(value).is_ok() {
+                return Some("path_uuid");
+            }
+        }
+    }
+    None
 }
 
 fn add(
@@ -286,6 +370,49 @@ mod tests {
         assert_eq!(
             classes("/ordinary?next=/admin"),
             BTreeSet::from(["Unknown"])
+        );
+    }
+
+    #[test]
+    fn content_slugs_do_not_create_functional_security_classes() {
+        assert_eq!(
+            classes("/hc/en-us/articles/12345-how-to-use-mfa-sso-login"),
+            BTreeSet::from(["Unknown"])
+        );
+        assert_eq!(
+            classes("/help/articles/987-zip-download-account-document"),
+            BTreeSet::from(["Unknown"])
+        );
+        assert_eq!(classes("/auth/login"), BTreeSet::from(["Authentication"]));
+        assert_eq!(
+            classes("/api/users/123"),
+            BTreeSet::from(["Api", "UserProfile"])
+        );
+    }
+
+    #[test]
+    fn path_identifiers_require_meaningful_non_content_resource_context() {
+        assert_eq!(
+            path_identifier_name("https://example.com/users/123"),
+            Some("path_id")
+        );
+        assert_eq!(
+            path_identifier_name(
+                "https://example.com/api/orders/550e8400-e29b-41d4-a716-446655440000"
+            ),
+            Some("path_uuid")
+        );
+        assert_eq!(
+            path_identifier_name("https://example.com/categories/123"),
+            None
+        );
+        assert_eq!(
+            path_identifier_name("https://example.com/hc/articles/123/login"),
+            None
+        );
+        assert_eq!(
+            path_identifier_name("https://example.com/releases/2026"),
+            None
         );
     }
 

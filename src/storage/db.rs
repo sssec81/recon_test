@@ -538,6 +538,10 @@ pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> 
         "DELETE FROM parameter_semantics WHERE scan_id=?1",
         params![scan_id],
     )?;
+    tx.execute(
+        "DELETE FROM endpoint_request_shapes WHERE scan_id=?1 AND source='path_classifier'",
+        params![scan_id],
+    )?;
     for (endpoint_id, canonical_url) in rows {
         let raw_urls = {
             let mut statement = tx.prepare(
@@ -567,17 +571,7 @@ pub fn classify_scan_inventory(conn: &Connection, scan_id: &Uuid) -> Result<()> 
                     .collect::<Result<Vec<_>>>()?,
             );
         }
-        let path_parameter = reqwest::Url::parse(&canonical_url).ok().and_then(|url| {
-            url.path_segments()?.find_map(|segment| {
-                if !segment.is_empty() && segment.chars().all(|value| value.is_ascii_digit()) {
-                    Some("path_id")
-                } else if uuid::Uuid::parse_str(segment).is_ok() {
-                    Some("path_uuid")
-                } else {
-                    None
-                }
-            })
-        });
+        let path_parameter = crate::scan::classify::path_identifier_name(&canonical_url);
         if let Some(name) = path_parameter {
             parameters.insert(name.to_string());
             tx.execute("INSERT OR IGNORE INTO endpoint_request_shapes VALUES (?1,?2,'GET','path_classifier','path',?3)",params![scan_id,endpoint_id,name])?;
@@ -660,6 +654,14 @@ pub fn finish_scan_run(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
     conn.execute(
         "UPDATE scan_runs SET finished_at = ?1 WHERE id = ?2",
         params![now, scan_run_id.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn clear_scan_finish(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
+    conn.execute(
+        "UPDATE scan_runs SET finished_at = NULL WHERE id = ?1",
+        params![scan_run_id.to_string()],
     )?;
     Ok(())
 }

@@ -170,10 +170,11 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
             });
 
         let mut reasons = BTreeMap::<String, ScoreReason>::new();
+        let has_security_signal = !categories.is_empty();
         add_reason(
             &mut reasons,
             format!("evidence_state:{}", strongest.as_str()),
-            evidence_points(strongest),
+            evidence_points(strongest, has_security_signal),
             format!("strongest evidence state is {}", strongest.as_str()),
         );
         if item.live {
@@ -406,32 +407,53 @@ fn derived_categories(
 }
 
 fn score_provenance(reasons: &mut BTreeMap<String, ScoreReason>, sources: &BTreeSet<String>) {
-    let dimensions = [
-        ("source_map", 8, "source-map provenance"),
-        ("javascript", 6, "JavaScript provenance"),
-        ("http_probe", 5, "live HTTP provenance"),
-        ("triage_fetch", 5, "live triage-fetch provenance"),
-        ("verification", 5, "live verification provenance"),
-    ];
-    let mut awarded = 0u16;
-    for (source, points, explanation) in dimensions {
-        if sources.contains(source) {
-            let actual = points.min(15 - awarded);
-            add_reason(reasons, format!("provenance:{source}"), actual, explanation);
-            awarded += actual;
-        }
+    // Reward independent evidence families, not several observations produced
+    // by the same crawl/live pipeline.
+    let live = sources.iter().any(|source| {
+        matches!(
+            source.as_str(),
+            "http_probe" | "triage_fetch" | "verification"
+        )
+    });
+    if live {
+        add_reason(reasons, "provenance:live", 5, "live HTTP evidence family");
     }
+    let crawl = sources.iter().any(|source| {
+        matches!(
+            source.as_str(),
+            "javascript" | "javascript_call" | "triage_link" | "triage_script"
+        )
+    });
+    if sources.contains("source_map") {
+        add_reason(
+            reasons,
+            "provenance:code",
+            8,
+            "source-map/code evidence family",
+        );
+    } else if crawl {
+        add_reason(
+            reasons,
+            "provenance:code",
+            6,
+            "crawl-derived code evidence family",
+        );
+    }
+    let awarded: u16 = reasons
+        .values()
+        .filter(|reason| reason.code.starts_with("provenance:"))
+        .map(|reason| reason.points)
+        .sum();
     if awarded < 15
         && sources
             .iter()
             .any(|source| is_historical_source(source.as_str()))
     {
-        let actual = 3.min(15 - awarded);
         add_reason(
             reasons,
             "provenance:historical",
-            actual,
-            "historical provenance",
+            3.min(15 - awarded),
+            "historical evidence family",
         );
     }
 }
@@ -677,6 +699,15 @@ fn suppression(
     state: EvidenceState,
     categories: &BTreeSet<String>,
 ) -> Option<String> {
+    let functional_api_evidence = item
+        .classes
+        .iter()
+        .any(|class| matches!(class.as_str(), "Api" | "GraphQL" | "Webhook" | "Upload"));
+    if crate::scan::classify::is_content_route(&item.canonical_url) && !functional_api_evidence {
+        return Some(
+            "documentation/content route without independent functional API evidence".into(),
+        );
+    }
     if !item.live && state == EvidenceState::Unverified {
         return Some("passive-only endpoint without confirmed-live evidence".into());
     }
@@ -740,7 +771,10 @@ fn add_reason(
     });
 }
 
-fn evidence_points(state: EvidenceState) -> u16 {
+fn evidence_points(state: EvidenceState, has_security_signal: bool) -> u16 {
+    if !has_security_signal {
+        return 0;
+    }
     match state {
         EvidenceState::ControlVerified => 30,
         EvidenceState::Repeatable => 20,
@@ -999,6 +1033,14 @@ mod tests {
             reasons.values().map(|reason| reason.points).sum::<u16>(),
             15
         );
+        let crawl_aliases = ["javascript", "triage_link", "triage_script"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut crawl_reasons = BTreeMap::new();
+        score_provenance(&mut crawl_reasons, &crawl_aliases);
+        assert_eq!(crawl_reasons.len(), 1);
+        assert_eq!(crawl_reasons["provenance:code"].points, 6);
         let parameters = [
             ParameterEvidence {
                 name: "user_id".into(),
@@ -1017,11 +1059,12 @@ mod tests {
         assert!(uncapped > 100);
         assert_eq!(uncapped.min(100), 100);
         assert!(
-            evidence_points(EvidenceState::ControlVerified)
-                > evidence_points(EvidenceState::Repeatable)
+            evidence_points(EvidenceState::ControlVerified, true)
+                > evidence_points(EvidenceState::Repeatable, true)
         );
         assert!(
-            evidence_points(EvidenceState::Repeatable) > evidence_points(EvidenceState::Observed)
+            evidence_points(EvidenceState::Repeatable, true)
+                > evidence_points(EvidenceState::Observed, true)
         );
         let mut class_reasons = BTreeMap::new();
         score_classes(
@@ -1029,10 +1072,11 @@ mod tests {
             &["Admin".to_string()].into_iter().collect(),
         );
         assert!(
-            evidence_points(EvidenceState::ControlVerified)
-                - evidence_points(EvidenceState::Observed)
+            evidence_points(EvidenceState::ControlVerified, true)
+                - evidence_points(EvidenceState::Observed, true)
                 > class_reasons.values().map(|reason| reason.points).sum()
         );
+        assert_eq!(evidence_points(EvidenceState::Repeatable, false), 0);
     }
 
     #[test]

@@ -375,12 +375,17 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             output_dir: std::path::PathBuf::from(&args.triage_dir),
         },
     )?;
-    crate::review::generate(&conn, scan_run.id, std::path::Path::new(&args.triage_dir))?;
-
-    // A non-null finish time means every deterministic stage succeeded and the
-    // scan is eligible as a historical baseline. Optional AI remains nonfatal.
+    // Record completion before rendering so the Phase 5 package contains its
+    // actual finish time. If rendering fails, roll the marker back: only a run
+    // with every deterministic artifact remains eligible as a baseline.
     scan_run.complete();
     db::finish_scan_run(&conn, &scan_run.id)?;
+    if let Err(error) =
+        crate::review::generate(&conn, scan_run.id, std::path::Path::new(&args.triage_dir))
+    {
+        db::clear_scan_finish(&conn, &scan_run.id)?;
+        return Err(error);
+    }
     println!("🎉 ScanRun {} completed successfully!", scan_run.id);
 
     if args.ai_analyze {

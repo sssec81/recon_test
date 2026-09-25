@@ -276,6 +276,12 @@ pub fn generate(
             &scan,
             &endpoint_id,
         )?;
+        let functional_api_evidence = classes
+            .iter()
+            .any(|class| matches!(class.as_str(), "Api" | "GraphQL" | "Webhook" | "Upload"));
+        if crate::scan::classify::is_content_route(&canonical_url) && !functional_api_evidence {
+            continue;
+        }
         let live: Option<(String, String, ResponseFingerprint)> = conn.query_row(
             "SELECT h.url,h.id,f.status,f.body_length,f.captured_length,f.body_complete,f.raw_hash,f.normalized_hash,f.content_type,f.header_hash,f.redirect_target,f.json_shape_hash,f.timing_bucket FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id WHERE h.scan_id=?1 AND f.endpoint_id=?2 AND f.body_complete=1 AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=h.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY h.observed_at,h.id LIMIT 1",
             params![scan, endpoint_id], |row| Ok((row.get(0)?, row.get(1)?, fingerprint_row(row, 2)?))).optional()?;
@@ -669,6 +675,45 @@ mod tests {
                 && o.evidence_state == EvidenceState::Unverified)
         );
         assert!(generate(&conn, Uuid::new_v4()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn content_routes_do_not_become_security_opportunities_from_titles_or_ids() {
+        let conn = db::init_db(":memory:").unwrap();
+        let scan = ScanRun::new(vec!["example.com".into()], "content".into());
+        db::save_scan_run(&conn, &scan).unwrap();
+        for url in [
+            "https://example.com/hc/en-us/articles/123-how-to-use-mfa-sso-login",
+            "https://example.com/hc/en-us/categories/43062167779859",
+            "https://example.com/help/articles/456-zip-download",
+        ] {
+            db::save_endpoint_observation(&conn, &scan.id, url, "triage_link", None).unwrap();
+        }
+        let content_endpoint = crate::scan::normalize::endpoint_id(
+            &crate::scan::normalize::normalize_endpoint(
+                "https://example.com/hc/en-us/categories/43062167779859",
+                None,
+            )
+            .unwrap(),
+        );
+        // Simulate a row left by the broader pre-hardening classifier. A
+        // rebuild must remove derived path evidence, not accumulate it.
+        conn.execute(
+            "INSERT INTO endpoint_request_shapes VALUES (?1,?2,'GET','path_classifier','path','path_id')",
+            params![scan.id.to_string(), content_endpoint],
+        )
+        .unwrap();
+        db::classify_scan_inventory(&conn, &scan.id).unwrap();
+        assert!(generate(&conn, scan.id).unwrap().is_empty());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM parameter_semantics WHERE scan_id=?1 AND semantic='ObjectId'",
+                params![scan.id.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
