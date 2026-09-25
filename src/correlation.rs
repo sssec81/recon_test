@@ -99,6 +99,7 @@ struct EndpointEvidence {
     provenance: BTreeSet<String>,
     live: bool,
     complete_fingerprint: bool,
+    independent_functional_evidence: bool,
     fingerprint: Option<FingerprintSummary>,
     opportunities: Vec<OpportunityEvidence>,
 }
@@ -308,6 +309,14 @@ fn load_sets(
             if item.fingerprint.is_none() || fingerprint.complete {
                 item.fingerprint = Some(fingerprint);
             }
+        }
+    }
+    let mut functional = conn.prepare(
+        "SELECT endpoint_id FROM endpoint_request_shapes WHERE scan_id=?1 AND upper(method) NOT IN ('GET','HEAD','OPTIONS') UNION SELECT f.endpoint_id FROM response_fingerprints f WHERE f.scan_id=?1 AND f.body_complete=1 AND (f.json_shape_hash IS NOT NULL OR lower(COALESCE(f.content_type,'')) LIKE '%json%') AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=f.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY endpoint_id",
+    )?;
+    for row in functional.query_map(params![scan], |row| row.get::<_, String>(0))? {
+        if let Some(item) = map.get_mut(&row?) {
+            item.independent_functional_evidence = true;
         }
     }
     let mut opportunities = conn.prepare("SELECT id,endpoint_id,category,evidence_state,suppression_reason FROM investigation_opportunities WHERE scan_id=?1 ORDER BY endpoint_id,category,id")?;
@@ -699,11 +708,9 @@ fn suppression(
     state: EvidenceState,
     categories: &BTreeSet<String>,
 ) -> Option<String> {
-    let functional_api_evidence = item
-        .classes
-        .iter()
-        .any(|class| matches!(class.as_str(), "Api" | "GraphQL" | "Webhook" | "Upload"));
-    if crate::scan::classify::is_content_route(&item.canonical_url) && !functional_api_evidence {
+    if crate::scan::classify::is_content_route(&item.canonical_url)
+        && !item.independent_functional_evidence
+    {
         return Some(
             "documentation/content route without independent functional API evidence".into(),
         );

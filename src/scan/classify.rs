@@ -50,9 +50,20 @@ pub fn endpoint_classes(canonical_url: &str) -> BTreeSet<&'static str> {
     let Ok(url) = reqwest::Url::parse(canonical_url) else {
         return BTreeSet::from(["Unknown"]);
     };
-    // Endpoint classes describe route structure. Do not split prose-like slugs
-    // (`how-to-use-sso`, `zip-download`) into security-significant words.
-    let tokens: BTreeSet<String> = path_segments(&url).collect();
+    // Exact hostname labels are strong recon structure (`admin.example.com`).
+    // Path compounds are split only when they are short and outside content
+    // trees, so `user-profile` works without reviving long editorial slugs.
+    let content_route = is_content_url(&url);
+    let segments: Vec<String> = path_segments(&url).collect();
+    let mut tokens: BTreeSet<String> = segments.iter().cloned().collect();
+    if let Some(host) = url.host_str() {
+        tokens.extend(host.split('.').map(str::to_ascii_lowercase));
+    }
+    if !content_route {
+        for segment in &segments {
+            tokens.extend(short_compound_words(segment));
+        }
+    }
 
     let mut tags = BTreeSet::new();
     add(
@@ -234,13 +245,36 @@ fn path_segments(url: &reqwest::Url) -> impl Iterator<Item = String> + '_ {
         .map(str::to_ascii_lowercase)
 }
 
+fn short_compound_words(segment: &str) -> impl Iterator<Item = String> + '_ {
+    let parts: Vec<&str> = segment
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let structural = parts.len() == 2
+        && segment.len() <= 24
+        && parts.iter().all(|part| {
+            part.len() <= 12
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        });
+    parts
+        .into_iter()
+        .filter(move |_| structural)
+        .map(str::to_ascii_lowercase)
+}
+
 /// Public documentation and editorial routes need stronger evidence than
 /// words embedded in their titles before they become security opportunities.
 pub fn is_content_route(canonical_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(canonical_url) else {
         return false;
     };
-    path_segments(&url).any(|segment| {
+    is_content_url(&url)
+}
+
+fn is_content_url(url: &reqwest::Url) -> bool {
+    path_segments(url).any(|segment| {
         matches!(
             segment.as_str(),
             "article"
@@ -387,6 +421,41 @@ mod tests {
         assert_eq!(
             classes("/api/users/123"),
             BTreeSet::from(["Api", "UserProfile"])
+        );
+    }
+
+    #[test]
+    fn exact_hostname_labels_and_short_route_compounds_are_structural() {
+        let fixtures = [
+            ("https://admin.example.com/", &["Admin"][..]),
+            ("https://api.example.com/", &["Api"]),
+            ("https://auth.example.com/", &["Authentication"]),
+            ("https://accounts.example.com/", &["Account"]),
+            ("https://graphql.example.com/", &["GraphQL"]),
+            ("https://upload.example.com/", &["Upload"]),
+            (
+                "https://example.com/api/user-profile",
+                &["Api", "UserProfile"],
+            ),
+            (
+                "https://example.com/api/file-upload",
+                &["Api", "Document", "Upload"],
+            ),
+            (
+                "https://example.com/api/oauth-login",
+                &["Api", "Authentication"],
+            ),
+        ];
+        for (url, expected) in fixtures {
+            assert_eq!(
+                endpoint_classes(url),
+                expected.iter().copied().collect(),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            endpoint_classes("https://example.com/help/file-upload"),
+            BTreeSet::from(["Unknown"])
         );
     }
 

@@ -666,6 +666,29 @@ pub fn clear_scan_finish(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Behavioral evidence independent of URL-derived endpoint classes. This is
+/// intentionally narrow because it is used to exempt content routes from
+/// documentation suppression.
+pub fn has_independent_functional_evidence(
+    conn: &Connection,
+    scan_id: &str,
+    endpoint_id: &str,
+) -> Result<bool> {
+    let non_get = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM endpoint_request_shapes WHERE scan_id=?1 AND endpoint_id=?2 AND upper(method) NOT IN ('GET','HEAD','OPTIONS'))",
+        params![scan_id, endpoint_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if non_get {
+        return Ok(true);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM response_fingerprints f WHERE f.scan_id=?1 AND f.endpoint_id=?2 AND f.body_complete=1 AND (f.json_shape_hash IS NOT NULL OR lower(COALESCE(f.content_type,'')) LIKE '%json%') AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=f.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')))",
+        params![scan_id, endpoint_id],
+        |row| row.get::<_, bool>(0),
+    )
+}
+
 pub fn get_previous_compatible_scan(conn: &Connection, current: &ScanRun) -> Result<Option<Uuid>> {
     let scope = serde_json::to_string(&current.root_scope).unwrap_or_default();
     let result = conn.query_row(

@@ -276,10 +276,11 @@ pub fn generate(
             &scan,
             &endpoint_id,
         )?;
-        let functional_api_evidence = classes
-            .iter()
-            .any(|class| matches!(class.as_str(), "Api" | "GraphQL" | "Webhook" | "Upload"));
-        if crate::scan::classify::is_content_route(&canonical_url) && !functional_api_evidence {
+        let independent_functional_evidence =
+            crate::storage::db::has_independent_functional_evidence(conn, &scan, &endpoint_id)?;
+        if crate::scan::classify::is_content_route(&canonical_url)
+            && !independent_functional_evidence
+        {
             continue;
         }
         let live: Option<(String, String, ResponseFingerprint)> = conn.query_row(
@@ -686,6 +687,10 @@ mod tests {
             "https://example.com/hc/en-us/articles/123-how-to-use-mfa-sso-login",
             "https://example.com/hc/en-us/categories/43062167779859",
             "https://example.com/help/articles/456-zip-download",
+            "https://example.com/help/upload",
+            "https://example.com/docs/graphql",
+            "https://example.com/support/webhook",
+            "https://example.com/help/api/upload",
         ] {
             db::save_endpoint_observation(&conn, &scan.id, url, "triage_link", None).unwrap();
         }
@@ -714,6 +719,22 @@ mod tests {
             .unwrap(),
             0
         );
+
+        let graphql_endpoint = crate::scan::normalize::endpoint_id(
+            &crate::scan::normalize::normalize_endpoint("https://example.com/docs/graphql", None)
+                .unwrap(),
+        );
+        conn.execute(
+            "INSERT INTO endpoint_request_shapes VALUES (?1,?2,'POST','javascript_call','json','query')",
+            params![scan.id.to_string(), graphql_endpoint],
+        )
+        .unwrap();
+        let opportunities = generate(&conn, scan.id).unwrap();
+        assert_eq!(opportunities.len(), 1);
+        assert!(opportunities.iter().all(|opportunity| {
+            opportunity.endpoint_id == graphql_endpoint
+                && opportunity.category == OpportunityCategory::GraphQLSurface
+        }));
     }
 
     #[tokio::test]
