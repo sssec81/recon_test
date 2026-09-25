@@ -202,6 +202,7 @@ mod tests {
                 elapsed_ms: 0,
                 error: None,
                 fingerprint: None,
+                redirect_hops: Vec::new(),
             },
             body: body.into(),
         }

@@ -59,10 +59,12 @@ impl<'a> FetchBudget<'a> {
         if self.requests > 0 && !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
-        self.requests += 1;
-        let scheduled = match self.client.get_with_trace(url).await {
+        let remaining = self.max_requests.saturating_sub(self.requests);
+        let contacts_before = self.client.contacts();
+        let scheduled = match self.client.get_with_trace_limited(url, remaining).await {
             Ok(response) => response,
             Err(error) => {
+                self.requests += self.client.contacts().saturating_sub(contacts_before);
                 return Some(Page {
                     evidence: HttpEvidence {
                         requested_url: url.to_string(),
@@ -76,11 +78,13 @@ impl<'a> FetchBudget<'a> {
                         elapsed_ms: started.elapsed().as_millis() as u64,
                         error: Some(error.to_string()),
                         fingerprint: None,
+                        redirect_hops: Vec::new(),
                     },
                     body: String::new(),
                 });
             }
         };
+        self.requests += scheduled.requests_used;
         if scheduled.termination != crate::scan::network::RedirectTermination::FinalResponse {
             let redirect_detail = scheduled
                 .blocked_destination
@@ -113,6 +117,7 @@ impl<'a> FetchBudget<'a> {
                         .to_ascii_lowercase(),
                     ),
                     fingerprint: None,
+                    redirect_hops: scheduled.hops,
                 },
                 body: String::new(),
             });
@@ -201,6 +206,7 @@ impl<'a> FetchBudget<'a> {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 error: stream_error,
                 fingerprint: Some(response_fingerprint),
+                redirect_hops: scheduled.hops,
             },
             body,
         })
@@ -367,7 +373,7 @@ mod tests {
         let page = Page {
             evidence: HttpEvidence { requested_url: base.to_string(), final_url: None, status: Some(200),
                 content_type: Some("text/html".into()), bytes: 0, body_sha256: None, title: None,
-                body_excerpt: None, elapsed_ms: 0, error: None, fingerprint: None },
+                body_excerpt: None, elapsed_ms: 0, error: None, fingerprint: None, redirect_hops: Vec::new() },
             body: r#"<a href="/api/user?id=42">user</a><a href="https://outside.test/">out</a><a href="/logout">logout</a>"#.into(),
         };
         let links = extract_links(&page, &base, &scope);
@@ -393,6 +399,7 @@ mod tests {
                 elapsed_ms: 0,
                 error: None,
                 fingerprint: None,
+                redirect_hops: Vec::new(),
             },
             body: body.into(),
         };

@@ -95,6 +95,7 @@ pub struct RequestScheduler {
     hosts: Arc<Mutex<HashMap<String, Instant>>>,
     concurrency: Arc<Semaphore>,
     remaining: Arc<AtomicUsize>,
+    contacts: Arc<AtomicUsize>,
     global_interval: Duration,
     host_interval: Duration,
     deadline: Option<Instant>,
@@ -120,6 +121,14 @@ pub enum RedirectTermination {
     MissingLocation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RedirectHop {
+    pub requested_url: String,
+    pub status: u16,
+    pub location: Option<String>,
+    pub destination_in_scope: Option<bool>,
+}
+
 pub struct ScheduledResponse {
     pub response: Option<Response>,
     pub initial_url: Url,
@@ -127,6 +136,8 @@ pub struct ScheduledResponse {
     pub redirect_hops: usize,
     pub blocked_destination: Option<String>,
     pub termination: RedirectTermination,
+    pub hops: Vec<RedirectHop>,
+    pub requests_used: usize,
 }
 impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -152,6 +163,7 @@ impl RequestScheduler {
             hosts: Arc::new(Mutex::new(HashMap::new())),
             concurrency: Arc::new(Semaphore::new(max_concurrency.max(1))),
             remaining: Arc::new(AtomicUsize::new(budget)),
+            contacts: Arc::new(AtomicUsize::new(0)),
             global_interval: interval(global_rps),
             host_interval: interval(host_rps),
             deadline,
@@ -195,9 +207,21 @@ impl RequestScheduler {
         &self,
         url: &Url,
     ) -> Result<ScheduledResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_with_trace_limited(url, 6).await
+    }
+
+    pub async fn get_with_trace_limited(
+        &self,
+        url: &Url,
+        max_contacts: usize,
+    ) -> Result<ScheduledResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut current_url = url.clone();
         let mut visited = HashSet::new();
         let mut hops = 0;
+        let mut trace = Vec::new();
+        if max_contacts == 0 {
+            return Err(RequestError::BudgetExhausted.into());
+        }
         for _ in 0..=5 {
             if !visited.insert(current_url.to_string()) {
                 return Ok(ScheduledResponse {
@@ -207,11 +231,19 @@ impl RequestScheduler {
                     redirect_hops: hops,
                     blocked_destination: None,
                     termination: RedirectTermination::RedirectLoop,
+                    requests_used: trace.len(),
+                    hops: trace,
                 });
             }
             let response = self.get_one(&current_url).await?;
+            let status = response.status().as_u16();
             if !response.status().is_redirection() {
-                let status = response.status().as_u16();
+                trace.push(RedirectHop {
+                    requested_url: safe_url(&current_url),
+                    status,
+                    location: None,
+                    destination_in_scope: None,
+                });
                 return Ok(ScheduledResponse {
                     response: Some(response),
                     initial_url: url.clone(),
@@ -219,9 +251,10 @@ impl RequestScheduler {
                     redirect_hops: hops,
                     blocked_destination: None,
                     termination: RedirectTermination::FinalResponse,
+                    requests_used: trace.len(),
+                    hops: trace,
                 });
             }
-            let status = response.status().as_u16();
             let next = response
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -229,6 +262,12 @@ impl RequestScheduler {
                 .and_then(|value| current_url.join(value).ok())
                 .ok_or(RequestError::MissingLocation);
             let Ok(next) = next else {
+                trace.push(RedirectHop {
+                    requested_url: safe_url(&current_url),
+                    status,
+                    location: None,
+                    destination_in_scope: None,
+                });
                 return Ok(ScheduledResponse {
                     response: Some(response),
                     initial_url: url.clone(),
@@ -236,10 +275,19 @@ impl RequestScheduler {
                     redirect_hops: hops,
                     blocked_destination: None,
                     termination: RedirectTermination::MissingLocation,
+                    requests_used: trace.len(),
+                    hops: trace,
                 });
             };
+            let in_scope = self.scope.allows_redirect_url(&next);
+            trace.push(RedirectHop {
+                requested_url: safe_url(&current_url),
+                status,
+                location: Some(safe_url(&next)),
+                destination_in_scope: Some(in_scope),
+            });
             drop(response);
-            if !self.scope.allows_redirect_url(&next) {
+            if !in_scope {
                 let blocked_destination =
                     crate::scan::normalize::normalize_endpoint(next.as_str(), None)
                         .map(|endpoint| endpoint.canonical_url);
@@ -250,6 +298,20 @@ impl RequestScheduler {
                     redirect_hops: hops + 1,
                     blocked_destination,
                     termination: RedirectTermination::OutOfScope,
+                    requests_used: trace.len(),
+                    hops: trace,
+                });
+            }
+            if trace.len() >= max_contacts {
+                return Ok(ScheduledResponse {
+                    response: None,
+                    initial_url: url.clone(),
+                    last_status: Some(status),
+                    redirect_hops: hops + 1,
+                    blocked_destination: None,
+                    termination: RedirectTermination::RedirectLimit,
+                    requests_used: trace.len(),
+                    hops: trace,
                 });
             }
             current_url = next;
@@ -262,6 +324,8 @@ impl RequestScheduler {
             redirect_hops: hops,
             blocked_destination: None,
             termination: RedirectTermination::RedirectLimit,
+            requests_used: trace.len(),
+            hops: trace,
         })
     }
 
@@ -308,8 +372,18 @@ impl RequestScheduler {
                 Err(next) => current = next,
             }
         }
+        self.contacts.fetch_add(1, Ordering::SeqCst);
         Ok(self.client.get(url.clone()).send().await?)
     }
+
+    pub fn contacts(&self) -> usize {
+        self.contacts.load(Ordering::SeqCst)
+    }
+}
+fn safe_url(url: &Url) -> String {
+    crate::scan::normalize::normalize_endpoint(url.as_str(), None)
+        .map(|endpoint| endpoint.canonical_url)
+        .unwrap_or_else(|| "<invalid-endpoint>".into())
 }
 fn interval(rps: u32) -> Duration {
     if rps == 0 {

@@ -229,6 +229,13 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             complete BOOLEAN NOT NULL, limitation TEXT,
             PRIMARY KEY(scan_id,source_url,kind), FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
         );
+        CREATE TABLE IF NOT EXISTS redirect_observations (
+            scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+            status INTEGER NOT NULL, location TEXT, destination_in_scope BOOLEAN,
+            termination TEXT NOT NULL,
+            PRIMARY KEY(scan_id,endpoint_id,sequence),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
+        );
         CREATE TABLE IF NOT EXISTS investigation_opportunities (
             id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, endpoint_id TEXT NOT NULL,
             canonical_url TEXT NOT NULL, category TEXT NOT NULL, reason TEXT NOT NULL,
@@ -418,6 +425,34 @@ pub fn save_intelligence_status(
         "INSERT OR REPLACE INTO intelligence_statuses VALUES (?1,?2,?3,?4,?5)",
         params![scan_id.to_string(), source_url, kind, complete, limitation],
     )?;
+    Ok(())
+}
+
+pub fn save_redirect_trace(
+    conn: &Connection,
+    scan_id: &Uuid,
+    hops: &[crate::scan::network::RedirectHop],
+    termination: &str,
+) -> Result<()> {
+    for (sequence, hop) in hops.iter().enumerate() {
+        save_endpoint_observation(conn, scan_id, &hop.requested_url, "triage_fetch", None)?;
+        let Some(endpoint) = crate::scan::normalize::normalize_endpoint(&hop.requested_url, None)
+        else {
+            continue;
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO redirect_observations VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                scan_id.to_string(),
+                crate::scan::normalize::endpoint_id(&endpoint),
+                sequence as i64,
+                hop.status,
+                hop.location,
+                hop.destination_in_scope,
+                termination
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1132,6 +1167,10 @@ mod tests {
         })
         .unwrap();
         conn.query_row("SELECT count(*) FROM intelligence_statuses", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        conn.query_row("SELECT count(*) FROM redirect_observations", [], |r| {
             r.get::<_, i64>(0)
         })
         .unwrap();

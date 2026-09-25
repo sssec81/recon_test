@@ -125,6 +125,12 @@ pub async fn run(
             .and_then(|value| Url::parse(value).ok())
             .unwrap_or_else(|| url.clone());
         if let Some(conn) = conn
+            && !page.evidence.redirect_hops.is_empty()
+        {
+            let termination = page.evidence.error.as_deref().unwrap_or("final_response");
+            db::save_redirect_trace(conn, &scan_id, &page.evidence.redirect_hops, termination)?;
+        }
+        if let Some(conn) = conn
             && let (Some(status), Some(fingerprint)) =
                 (page.evidence.status, page.evidence.fingerprint.as_ref())
         {
@@ -458,6 +464,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn triage_request_cap_counts_each_scheduler_redirect_contact() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let contacts = Arc::new(AtomicUsize::new(0));
+        let server_contacts = contacts.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_contacts.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 512];
+                let size = socket.read(&mut request).await.unwrap();
+                let text = String::from_utf8_lossy(&request[..size]);
+                let response = if text.contains("GET /start ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /middle\r\nContent-Length: 0\r\n\r\n"
+                } else if text.contains("GET /middle ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let scheduler = RequestScheduler::new(
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            1,
+            10,
+            0,
+            0,
+            None,
+        );
+        let start: Url = format!("http://{address}/start").parse().unwrap();
+        let mut budget = FetchBudget::new(&scheduler, &scope, 3, 1, 0);
+        let page = budget.fetch(&start).await.unwrap();
+        assert_eq!(page.evidence.status, Some(200));
+        assert_eq!(page.evidence.redirect_hops.len(), 3);
+        assert!(
+            page.evidence.redirect_hops[0]
+                .requested_url
+                .ends_with("/start")
+        );
+        assert_eq!(page.evidence.redirect_hops[0].status, 302);
+        assert!(
+            page.evidence.redirect_hops[0]
+                .location
+                .as_deref()
+                .is_some_and(|value| value.ends_with("/middle"))
+        );
+        assert!(
+            page.evidence.redirect_hops[1]
+                .requested_url
+                .ends_with("/middle")
+        );
+        assert!(
+            page.evidence.redirect_hops[2]
+                .requested_url
+                .ends_with("/final")
+        );
+        assert_eq!(page.evidence.redirect_hops[2].status, 200);
+        assert_eq!(budget.requests, 3);
+        assert_eq!(contacts.load(Ordering::SeqCst), 3);
+        assert!(budget.fetch(&start).await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn deep_javascript_discovery_reaches_classification_verification_and_correlation() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -787,7 +863,16 @@ mod tests {
         .unwrap();
         assert_eq!(review.pages_crawled, 8);
         assert_eq!(review.findings.len(), 4);
-        assert_eq!(review.requests_sent, 23);
+        // Includes the additional contacted hop in the fixture's redirect chain.
+        assert_eq!(review.requests_sent, 24);
+        assert!(
+            conn.query_row("SELECT count(*) FROM redirect_observations", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap()
+                > 0
+        );
         assert_eq!(
             conn.query_row("SELECT count(*) FROM source_map_observations", [], |row| {
                 row.get::<_, i64>(0)

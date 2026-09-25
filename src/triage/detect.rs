@@ -298,6 +298,7 @@ mod tests {
                 elapsed_ms: 1,
                 error: None,
                 fingerprint: None,
+                redirect_hops: Vec::new(),
             },
             body: body.into(),
         }
@@ -358,6 +359,7 @@ mod tests {
             elapsed_ms: 1,
             error: None,
             fingerprint: None,
+            redirect_hops: Vec::new(),
         };
         let control = HttpEvidence {
             requested_url: control_url.clone(),
