@@ -34,7 +34,12 @@ pub struct JavaScriptCandidate {
     pub parameters: BTreeSet<(String, String)>,
 }
 
-pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaScriptCandidate> {
+pub fn extract(
+    script: &str,
+    _source_url: &Url,
+    resolution_base: &Url,
+    scope: &ScopePolicy,
+) -> Vec<JavaScriptCandidate> {
     let constants = string_constants(script);
     let mut candidates = Vec::new();
     for captures in MEMBER_CALL.captures_iter(script) {
@@ -69,7 +74,7 @@ pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaS
                 &raw,
                 &method,
                 parts.get(url_index + 1).copied().unwrap_or_default(),
-                source_url,
+                resolution_base,
                 scope,
             );
         }
@@ -88,7 +93,7 @@ pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaS
                 &raw,
                 &option_method(arguments).unwrap_or_else(|| "GET".into()),
                 parts.get(1).copied().unwrap_or_default(),
-                source_url,
+                resolution_base,
                 scope,
             );
         }
@@ -111,7 +116,7 @@ pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaS
                 &raw,
                 &method.to_ascii_uppercase(),
                 "",
-                source_url,
+                resolution_base,
                 scope,
             );
         }
@@ -124,7 +129,7 @@ pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaS
                 &mut candidates,
                 "url_literal",
                 value.as_str(),
-                source_url,
+                resolution_base,
                 scope,
             );
         }
@@ -132,7 +137,7 @@ pub fn extract(script: &str, source_url: &Url, scope: &ScopePolicy) -> Vec<JavaS
     for captures in WEBSOCKET.captures_iter(script) {
         if let Some(value) = captures.get(1) {
             let raw = value.as_str();
-            let resolved = source_url.join(raw).ok();
+            let resolved = resolution_base.join(raw).ok();
             if resolved.as_ref().is_some_and(|url| {
                 matches!(url.scheme(), "ws" | "wss")
                     && url.host_str().is_some_and(|host| {
@@ -472,7 +477,7 @@ mod tests {
             fetch("/api/Users", {method: "DELETE", body: {userId: id}});
             const broken = "/g,%60&quot;%60).replace/";
         "#;
-        let candidates = extract(script, &source, &scope);
+        let candidates = extract(script, &source, &source, &scope);
         let calls: Vec<_> = candidates
             .iter()
             .filter(|value| value.kind == "http_call")
@@ -501,5 +506,28 @@ mod tests {
                 .iter()
                 .any(|value| value.kind == "parameter_name")
         );
+    }
+
+    #[test]
+    fn resolves_browser_requests_against_document_not_script_or_map() {
+        let scope = ScopePolicy::new(vec!["example.com".into()]);
+        let document = Url::parse("https://example.com/app/").unwrap();
+        let script = Url::parse("https://example.com/assets/main.js").unwrap();
+        let map = Url::parse("https://example.com/assets/main.js.map").unwrap();
+
+        for source in [&script, &map] {
+            let candidates = extract(r#"fetch("./api/users")"#, source, &document, &scope);
+            assert!(candidates.iter().any(|candidate| {
+                candidate.kind == "http_call"
+                    && candidate.resolved_url.as_deref()
+                        == Some("https://example.com/app/api/users")
+            }));
+            assert!(
+                !candidates
+                    .iter()
+                    .any(|candidate| candidate.resolved_url.as_deref()
+                        == Some("https://example.com/assets/api/users"))
+            );
+        }
     }
 }

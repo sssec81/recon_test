@@ -16,7 +16,7 @@ use model::{Confidence, Finding, ReviewQueue, SuppressedCandidate};
 #[cfg(test)]
 use reqwest::Client;
 use reqwest::Url;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -87,6 +87,7 @@ pub async fn run(
     );
     let mut queue: VecDeque<(Url, usize)> = VecDeque::new();
     let mut seen_urls = HashSet::new();
+    let mut script_resolution_bases: HashMap<String, Url> = HashMap::new();
     for observation in observations {
         if observation
             .status_code
@@ -124,6 +125,10 @@ pub async fn run(
             .as_deref()
             .and_then(|value| Url::parse(value).ok())
             .unwrap_or_else(|| url.clone());
+        let resolution_base = script_resolution_bases
+            .get(url.as_str())
+            .cloned()
+            .unwrap_or_else(|| response_url.clone());
         if let Some(conn) = conn
             && !page.evidence.redirect_hops.is_empty()
         {
@@ -145,14 +150,9 @@ pub async fn run(
             )?;
         }
         if let Some(conn) = conn
-            && let Some(script) = script_text(&page)
+            && let Some(script) = script_text(&page, &response_url)
         {
-            if page
-                .evidence
-                .content_type
-                .as_deref()
-                .is_some_and(|value| value.contains("javascript"))
-            {
+            if crawl::is_javascript_resource(page.evidence.content_type.as_deref(), &response_url) {
                 let complete = page
                     .evidence
                     .fingerprint
@@ -169,7 +169,9 @@ pub async fn run(
                     ),
                 )?;
             }
-            for candidate in crate::scan::javascript::extract(&script, &response_url, scope) {
+            for candidate in
+                crate::scan::javascript::extract(&script, &response_url, &resolution_base, scope)
+            {
                 db::save_javascript_observation(
                     conn,
                     &scan_id,
@@ -178,11 +180,7 @@ pub async fn run(
                     &candidate,
                 )?;
             }
-            if page
-                .evidence
-                .content_type
-                .as_deref()
-                .is_some_and(|content_type| content_type.contains("javascript"))
+            if crawl::is_javascript_resource(page.evidence.content_type.as_deref(), &response_url)
                 && let Some(map_url) = crate::scan::sourcemap::map_candidate(&response_url, &script)
                 && scope.allows_redirect_url(&map_url)
                 && let Some(map_page) = budget.fetch(&map_url).await
@@ -223,8 +221,12 @@ pub async fn run(
                         )?;
                     }
                     for source in map.source_contents {
-                        for candidate in crate::scan::javascript::extract(&source, &map_url, scope)
-                        {
+                        for candidate in crate::scan::javascript::extract(
+                            &source,
+                            &map_url,
+                            &resolution_base,
+                            scope,
+                        ) {
                             db::save_javascript_observation(
                                 conn,
                                 &scan_id,
@@ -237,7 +239,7 @@ pub async fn run(
                 }
             }
         }
-        inventory.record_page(&response_url, &page, scope);
+        inventory.record_page(&response_url, &page, scope, &resolution_base);
         for finding in detect::detect(&page, &response_url) {
             if !seen_candidates.insert(finding.id.clone()) {
                 duplicates_removed += 1;
@@ -262,8 +264,16 @@ pub async fn run(
                 .final_url
                 .as_deref()
                 .and_then(|value| Url::parse(value).ok())
-                .unwrap_or(url);
-            for link in extract_links(&page, &base, scope) {
+                .unwrap_or_else(|| url.clone());
+            let extraction_base = if crawl::is_javascript_resource(
+                page.evidence.content_type.as_deref(),
+                &response_url,
+            ) {
+                &resolution_base
+            } else {
+                &base
+            };
+            for link in extract_links(&page, extraction_base, scope) {
                 if let Some(conn) = conn {
                     db::save_endpoint_observation(
                         conn,
@@ -281,6 +291,11 @@ pub async fn run(
                         },
                         Some(base.as_str()),
                     )?;
+                }
+                if crawl::is_javascript_resource(None, &link) {
+                    script_resolution_bases
+                        .entry(link.to_string())
+                        .or_insert_with(|| resolution_base.clone());
                 }
                 if seen_urls.insert(link.to_string()) {
                     queue.push_back((link, depth + 1));
@@ -915,7 +930,7 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap()
-            .contains("/maps/api/users")
+            .contains("/api/users")
         );
         assert_eq!(review.response_anomalies, 1);
         assert_eq!(review.duplicates_removed, 1);

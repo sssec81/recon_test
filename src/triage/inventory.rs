@@ -69,7 +69,13 @@ impl Inventory {
         endpoint.sources.insert(source.into());
     }
 
-    pub fn record_page(&mut self, url: &Url, page: &Page, scope: &ScopePolicy) {
+    pub fn record_page(
+        &mut self,
+        url: &Url,
+        page: &Page,
+        scope: &ScopePolicy,
+        resolution_base: &Url,
+    ) {
         self.record(url, "GET", "triage_fetch", std::iter::empty());
         let key = format!("GET {}", route_template(url));
         if let Some(endpoint) = self.endpoints.get_mut(&key) {
@@ -111,11 +117,19 @@ impl Inventory {
                     evidence: page.evidence.clone(),
                 });
         }
-        for link in extract_links(page, url, scope) {
+        let extraction_base = if crate::triage::crawl::is_javascript_resource(
+            page.evidence.content_type.as_deref(),
+            url,
+        ) {
+            resolution_base
+        } else {
+            url
+        };
+        for link in extract_links(page, extraction_base, scope) {
             self.record(&link, "GET", "page_or_script", std::iter::empty());
         }
-        if let Some(script) = script_text(page) {
-            for (endpoint, method) in extract_js_calls(&script, url, scope) {
+        if let Some(script) = script_text(page, url) {
+            for (endpoint, method) in extract_js_calls(&script, url, resolution_base, scope) {
                 self.record(&endpoint, &method, "javascript_call", std::iter::empty());
             }
         }
@@ -214,7 +228,7 @@ mod tests {
         let url = Url::parse("https://example.com/").unwrap();
         let mut inventory = Inventory::default();
         inventory.record_page(&url, &page(url.as_str(), 200,
-            r#"<form method="post" action="/api/search"><input name="query"><input name="page"></form>"#), &scope);
+            r#"<form method="post" action="/api/search"><input name="query"><input name="page"></form>"#), &scope, &url);
         let endpoint = inventory
             .endpoints()
             .into_iter()
@@ -234,7 +248,8 @@ mod tests {
             ("https://example.com/api/items?id=2", 500),
             ("https://example.com/api/items?page=2", 200),
         ] {
-            inventory.record_page(&Url::parse(url).unwrap(), &page(url, status, ""), &scope);
+            let parsed = Url::parse(url).unwrap();
+            inventory.record_page(&parsed, &page(url, status, ""), &scope, &parsed);
         }
         let anomalies = inventory.anomalies();
         assert_eq!(anomalies.len(), 1);

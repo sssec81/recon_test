@@ -292,8 +292,8 @@ pub fn extract_links(page: &Page, base: &Url, scope: &ScopePolicy) -> Vec<Url> {
             }
         }
     }
-    if let Some(script_text) = script_text(page) {
-        let calls = extract_js_calls(&script_text, base, scope);
+    if let Some(script_text) = script_text(page, base) {
+        let calls = extract_js_calls(&script_text, base, base, scope);
         let non_get: HashSet<String> = calls
             .iter()
             .filter(|(_, method)| method != "GET")
@@ -321,7 +321,7 @@ pub fn extract_links(page: &Page, base: &Url, scope: &ScopePolicy) -> Vec<Url> {
     links
 }
 
-pub fn script_text(page: &Page) -> Option<String> {
+pub fn script_text(page: &Page, resource_url: &Url) -> Option<String> {
     if is_html(&page.evidence.content_type) {
         let document = Html::parse_document(&page.body);
         Selector::parse("script").ok().map(|selector| {
@@ -331,20 +331,20 @@ pub fn script_text(page: &Page) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("\n")
         })
-    } else if page
-        .evidence
-        .content_type
-        .as_deref()
-        .is_some_and(|t| t.contains("javascript"))
-    {
+    } else if is_javascript_resource(page.evidence.content_type.as_deref(), resource_url) {
         Some(page.body.clone())
     } else {
         None
     }
 }
 
-pub fn extract_js_calls(script: &str, base: &Url, scope: &ScopePolicy) -> Vec<(Url, String)> {
-    crate::scan::javascript::extract(script, base, scope)
+pub fn extract_js_calls(
+    script: &str,
+    source_url: &Url,
+    resolution_base: &Url,
+    scope: &ScopePolicy,
+) -> Vec<(Url, String)> {
+    crate::scan::javascript::extract(script, source_url, resolution_base, scope)
         .into_iter()
         .filter(|candidate| candidate.kind == "http_call")
         .filter_map(|candidate| {
@@ -356,9 +356,41 @@ pub fn extract_js_calls(script: &str, base: &Url, scope: &ScopePolicy) -> Vec<(U
         .collect()
 }
 
+pub fn is_javascript_resource(content_type: Option<&str>, resource_url: &Url) -> bool {
+    content_type.is_some_and(|value| value.to_ascii_lowercase().contains("javascript"))
+        || resource_url.path().to_ascii_lowercase().ends_with(".js")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn javascript_path_is_analyzed_despite_generic_content_type() {
+        let url = Url::parse("https://example.com/assets/app.js").unwrap();
+        let page = Page {
+            evidence: HttpEvidence {
+                requested_url: url.to_string(),
+                final_url: None,
+                status: Some(200),
+                content_type: Some("text/plain".into()),
+                bytes: 18,
+                body_sha256: None,
+                title: None,
+                body_excerpt: None,
+                elapsed_ms: 0,
+                error: None,
+                fingerprint: None,
+                redirect_hops: Vec::new(),
+            },
+            body: "fetch('/api/users')".into(),
+        };
+        assert!(script_text(&page, &url).is_some());
+        assert!(is_javascript_resource(
+            Some("application/octet-stream"),
+            &url
+        ));
+    }
     #[test]
     fn extracts_in_scope_links_and_skips_state_actions() {
         let scope = ScopePolicy::new(vec!["example.com".into()]);
@@ -399,7 +431,7 @@ mod tests {
         let links = extract_links(&page, &base, &scope);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].path(), "/api/items");
-        let calls = extract_js_calls(body, &base, &scope);
+        let calls = extract_js_calls(body, &base, &base, &scope);
         assert!(
             calls
                 .iter()
