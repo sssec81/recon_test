@@ -505,6 +505,24 @@ pub fn save_javascript_observation(
         && matches!(candidate.kind, "http_call" | "url_literal")
     {
         save_endpoint_observation(conn, scan_id, url, endpoint_source, Some(source_url))?;
+        if candidate.kind == "http_call" {
+            let method = candidate.method.as_deref().unwrap_or("UNKNOWN");
+            if candidate.parameters.is_empty() {
+                save_request_shape(conn, scan_id, url, method, endpoint_source, "endpoint", "")?;
+            } else {
+                for (location, name) in &candidate.parameters {
+                    save_request_shape(
+                        conn,
+                        scan_id,
+                        url,
+                        method,
+                        endpoint_source,
+                        location,
+                        name,
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1271,6 +1289,8 @@ mod tests {
             kind: "http_call",
             raw_value: "/api/users?id=1".into(),
             resolved_url: Some("https://example.com/api/users?id=1".into()),
+            method: Some("GET".into()),
+            parameters: [("query".into(), "id".into())].into_iter().collect(),
         };
         save_javascript_observation(
             &conn,
@@ -1294,6 +1314,15 @@ mod tests {
             )
             .unwrap(),
             "https://example.com/assets/app.js"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT method || ':' || parameter_location || ':' || parameter_name FROM endpoint_request_shapes",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "GET:query:id"
         );
     }
 
@@ -1337,6 +1366,8 @@ mod tests {
                 kind: "http_call",
                 raw_value: url.into(),
                 resolved_url: Some(url.into()),
+                method: Some("GET".into()),
+                parameters: std::collections::BTreeSet::new(),
             };
             save_javascript_observation(
                 &conn,
@@ -1353,6 +1384,8 @@ mod tests {
             kind: "parameter_name",
             raw_value: "userId".into(),
             resolved_url: None,
+            method: None,
+            parameters: std::collections::BTreeSet::new(),
         };
         save_javascript_observation(
             &conn,

@@ -13,6 +13,7 @@ static SOURCE_MAPPING_URL: LazyLock<Regex> = LazyLock::new(|| {
 
 #[derive(Debug, Deserialize)]
 struct SourceMap {
+    version: Option<u8>,
     #[serde(default)]
     sources: Vec<String>,
     #[serde(rename = "sourcesContent", default)]
@@ -48,6 +49,9 @@ pub fn map_candidate(script_url: &Url, script: &str) -> Option<Url> {
 
 pub fn parse(body: &str) -> Option<ParsedSourceMap> {
     let map: SourceMap = serde_json::from_str(body).ok()?;
+    if map.version != Some(3) || map.sources.is_empty() {
+        return None;
+    }
     Some(ParsedSourceMap {
         source_files: map.sources,
         source_contents: map.sources_content.into_iter().flatten().collect(),
@@ -72,9 +76,11 @@ mod tests {
             "https://example.com/assets/app.js.map"
         );
         let map =
-            parse(r#"{"sources":["src/api.ts"],"sourcesContent":["fetch('/api/users?id=1')"]}"#)
+            parse(r#"{"version":3,"sources":["src/api.ts"],"sourcesContent":["fetch('/api/users?id=1')"]}"#)
                 .unwrap();
         assert_eq!(map.source_files, ["src/api.ts"]);
         assert_eq!(map.source_contents.len(), 1);
+        assert!(parse("<html>SPA fallback</html>").is_none());
+        assert!(parse(r#"{"sources":["not-a-map"]}"#).is_none());
     }
 }

@@ -201,7 +201,18 @@ pub async fn run(
                         fingerprint,
                     )?;
                 }
-                if let Some(map) = crate::scan::sourcemap::parse(&map_page.body) {
+                let parsed_map = crate::scan::sourcemap::parse(&map_page.body);
+                db::save_intelligence_status(
+                    conn,
+                    &scan_id,
+                    map_url.as_str(),
+                    "source_map_parse",
+                    parsed_map.is_some(),
+                    parsed_map
+                        .is_none()
+                        .then_some("response was not a valid Source Map v3 document"),
+                )?;
+                if let Some(map) = parsed_map {
                     for source_file in &map.source_files {
                         db::save_source_map_observation(
                             conn,
@@ -780,7 +791,7 @@ mod tests {
                         "/maps/app.js.map" => (
                             "200 OK",
                             "application/json",
-                            "{\"sources\":[\"src/routes/orders.ts\"],\"sourcesContent\":[\"fetch('./api/users')\"]}",
+                            "{\"version\":3,\"sources\":[\"src/routes/orders.ts\"],\"sourcesContent\":[\"fetch('./api/users')\"]}",
                         ),
                         "/api/items?id=1" => ("200 OK", "application/json", "{\"item\":1}"),
                         "/api/items?id=3" => ("200 OK", "application/json", "{\"item\":3}"),
@@ -879,6 +890,14 @@ mod tests {
             })
             .unwrap(),
             1
+        );
+        assert!(
+            conn.query_row(
+                "SELECT complete FROM intelligence_statuses WHERE kind='source_map_parse'",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
         );
         assert_eq!(
             conn.query_row(

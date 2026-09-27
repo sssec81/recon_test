@@ -10,16 +10,12 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
+const MAX_SCRIPT_BODY_BYTES: usize = 2 * 1024 * 1024;
 const EXCERPT_CHARS: usize = 1024;
 static API_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"["'](/(?:api|v[0-9]+)/[^"'\s<>]{1,180})["']"#)
         .expect("constant API path regex must compile")
 });
-static JS_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*["']([^"']{1,180})["']\s*(\)|,)"#)
-        .expect("constant JavaScript call regex must compile")
-});
-
 pub struct FetchBudget<'a> {
     client: &'a RequestScheduler,
     scope: &'a ScopePolicy,
@@ -135,6 +131,15 @@ impl<'a> FetchBudget<'a> {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let capture_limit = if content_type
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("javascript"))
+            || final_url.path().ends_with(".js")
+        {
+            MAX_SCRIPT_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        };
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         let mut stream_error = None;
@@ -142,7 +147,7 @@ impl<'a> FetchBudget<'a> {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
-                    let remaining = MAX_BODY_BYTES.saturating_sub(bytes.len());
+                    let remaining = capture_limit.saturating_sub(bytes.len());
                     bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                     if chunk.len() > remaining {
                         truncated = true;
@@ -339,26 +344,14 @@ pub fn script_text(page: &Page) -> Option<String> {
 }
 
 pub fn extract_js_calls(script: &str, base: &Url, scope: &ScopePolicy) -> Vec<(Url, String)> {
-    JS_CALL
-        .captures_iter(script)
-        .filter_map(|captures| {
-            let call = captures.get(1)?.as_str().to_ascii_lowercase();
-            let path = captures.get(2)?.as_str();
-            let suffix = captures.get(3)?.as_str();
-            let method = if call == "fetch" {
-                if suffix == ")" { "GET" } else { "UNKNOWN" }
-            } else {
-                match call.as_str() {
-                    "axios.get" => "GET",
-                    "axios.post" => "POST",
-                    "axios.put" => "PUT",
-                    "axios.patch" => "PATCH",
-                    "axios.delete" => "DELETE",
-                    _ => "UNKNOWN",
-                }
-            };
-            let url = base.join(path).ok()?;
-            is_safe_url(&url, scope).then_some((url, method.to_string()))
+    crate::scan::javascript::extract(script, base, scope)
+        .into_iter()
+        .filter(|candidate| candidate.kind == "http_call")
+        .filter_map(|candidate| {
+            Some((
+                Url::parse(candidate.resolved_url.as_deref()?).ok()?,
+                candidate.method.unwrap_or_else(|| "UNKNOWN".into()),
+            ))
         })
         .collect()
 }
