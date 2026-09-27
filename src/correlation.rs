@@ -119,6 +119,8 @@ struct OpportunityEvidence {
     category: String,
     state: EvidenceState,
     suppression: Option<String>,
+    bound_parameter: Option<String>,
+    live_request_bound: bool,
 }
 
 #[derive(Default)]
@@ -153,12 +155,31 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
     let mut candidates = Vec::new();
 
     for (endpoint_id, item) in &mut evidence {
-        let mut categories: BTreeSet<String> = item
+        let class_categories = derived_categories(&item.classes, &BTreeSet::new());
+        let bound_parameter_names: BTreeSet<&str> = item
             .opportunities
             .iter()
-            .map(|opportunity| opportunity.category.clone())
+            .filter(|opportunity| opportunity.live_request_bound)
+            .filter_map(|opportunity| opportunity.bound_parameter.as_deref())
             .collect();
-        categories.extend(derived_categories(&item.classes, &item.parameters));
+        let bound_parameters: BTreeSet<ParameterEvidence> = item
+            .parameters
+            .iter()
+            .filter(|parameter| bound_parameter_names.contains(parameter.name.as_str()))
+            .cloned()
+            .collect();
+        let mut categories = class_categories.clone();
+        categories.extend(derived_categories(&BTreeSet::new(), &bound_parameters));
+        categories.extend(
+            item.opportunities
+                .iter()
+                .filter(|opportunity| {
+                    opportunity.bound_parameter.is_none() || opportunity.live_request_bound
+                })
+                .map(|opportunity| opportunity.category.clone()),
+        );
+        let live_security_basis =
+            item.live && (!class_categories.is_empty() || !bound_parameters.is_empty());
         let strongest = item
             .opportunities
             .iter()
@@ -178,10 +199,10 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
             evidence_points(strongest, has_security_signal),
             format!("strongest evidence state is {}", strongest.as_str()),
         );
-        if item.live {
+        if live_security_basis {
             add_reason(&mut reasons, "live_endpoint", 10, "confirmed-live endpoint");
         }
-        if item.complete_fingerprint {
+        if live_security_basis && item.complete_fingerprint {
             add_reason(
                 &mut reasons,
                 "complete_fingerprint",
@@ -189,8 +210,8 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
                 "complete response fingerprint",
             );
         }
-        score_provenance(&mut reasons, &item.provenance);
-        score_parameters(&mut reasons, &item.parameters);
+        score_provenance(&mut reasons, &item.provenance, live_security_basis);
+        score_parameters(&mut reasons, &bound_parameters);
         score_classes(&mut reasons, &item.classes);
 
         let mut historical_signals = Vec::new();
@@ -210,7 +231,13 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
             .iter()
             .map(|opportunity| opportunity.id.clone())
             .collect();
-        let suppression_reason = suppression(item, strongest, &categories);
+        let suppression_reason = suppression(
+            item,
+            strongest,
+            &categories,
+            &class_categories,
+            !bound_parameters.is_empty(),
+        );
         let score = reasons
             .values()
             .map(|reason| reason.points)
@@ -319,7 +346,7 @@ fn load_sets(
             item.independent_functional_evidence = true;
         }
     }
-    let mut opportunities = conn.prepare("SELECT id,endpoint_id,category,evidence_state,suppression_reason FROM investigation_opportunities WHERE scan_id=?1 ORDER BY endpoint_id,category,id")?;
+    let mut opportunities = conn.prepare("SELECT o.id,o.endpoint_id,o.category,o.evidence_state,o.suppression_reason,b.parameter_name,b.live_observation_id IS NOT NULL FROM investigation_opportunities o LEFT JOIN opportunity_request_bindings b ON b.opportunity_id=o.id WHERE o.scan_id=?1 ORDER BY o.endpoint_id,o.category,o.id")?;
     for row in opportunities.query_map(params![scan], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -327,15 +354,20 @@ fn load_sets(
             row.get::<_, String>(2)?,
             EvidenceState::parse(&row.get::<_, String>(3)?),
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<bool>>(6)?.unwrap_or(false),
         ))
     })? {
-        let (id, endpoint, category, state, suppression) = row?;
+        let (id, endpoint, category, state, suppression, bound_parameter, live_request_bound) =
+            row?;
         if let Some(item) = map.get_mut(&endpoint) {
             item.opportunities.push(OpportunityEvidence {
                 id,
                 category,
                 state,
                 suppression,
+                bound_parameter,
+                live_request_bound,
             });
         }
     }
@@ -415,7 +447,11 @@ fn derived_categories(
     categories
 }
 
-fn score_provenance(reasons: &mut BTreeMap<String, ScoreReason>, sources: &BTreeSet<String>) {
+fn score_provenance(
+    reasons: &mut BTreeMap<String, ScoreReason>,
+    sources: &BTreeSet<String>,
+    allow_live: bool,
+) {
     // Reward independent evidence families, not several observations produced
     // by the same crawl/live pipeline.
     let live = sources.iter().any(|source| {
@@ -424,7 +460,7 @@ fn score_provenance(reasons: &mut BTreeMap<String, ScoreReason>, sources: &BTree
             "http_probe" | "triage_fetch" | "verification"
         )
     });
-    if live {
+    if live && allow_live {
         add_reason(reasons, "provenance:live", 5, "live HTTP evidence family");
     }
     let crawl = sources.iter().any(|source| {
@@ -707,6 +743,8 @@ fn suppression(
     item: &EndpointEvidence,
     state: EvidenceState,
     categories: &BTreeSet<String>,
+    class_categories: &BTreeSet<String>,
+    has_live_bound_parameter: bool,
 ) -> Option<String> {
     if crate::scan::classify::is_content_route(&item.canonical_url)
         && !item.independent_functional_evidence
@@ -717,6 +755,26 @@ fn suppression(
     }
     if !item.live && state == EvidenceState::Unverified {
         return Some("passive-only endpoint without confirmed-live evidence".into());
+    }
+    let has_parameter_category = item.parameters.iter().any(|parameter| {
+        matches!(
+            parameter.semantic.as_str(),
+            "Redirect"
+                | "Url"
+                | "ObjectId"
+                | "UserId"
+                | "AccountId"
+                | "File"
+                | "Path"
+                | "Webhook"
+                | "Search"
+                | "Query"
+        )
+    });
+    if class_categories.is_empty() && has_parameter_category && !has_live_bound_parameter {
+        return Some(
+            "parameter-derived security evidence has no matching live request binding".into(),
+        );
     }
     if categories.is_empty() {
         return Some(
@@ -1035,7 +1093,7 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect();
-        score_provenance(&mut reasons, &sources);
+        score_provenance(&mut reasons, &sources, true);
         assert_eq!(
             reasons.values().map(|reason| reason.points).sum::<u16>(),
             15
@@ -1045,7 +1103,7 @@ mod tests {
             .map(str::to_string)
             .collect();
         let mut crawl_reasons = BTreeMap::new();
-        score_provenance(&mut crawl_reasons, &crawl_aliases);
+        score_provenance(&mut crawl_reasons, &crawl_aliases, true);
         assert_eq!(crawl_reasons.len(), 1);
         assert_eq!(crawl_reasons["provenance:code"].points, 6);
         let parameters = [
@@ -1147,6 +1205,59 @@ mod tests {
                 .unwrap()
                 .suppression_reason
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn unbound_parameter_cannot_borrow_endpoint_live_scoring() {
+        let conn = db::init_db(":memory:").unwrap();
+        let mut run = ScanRun::new(vec!["example.com".into()], "binding-aware".into());
+        save_run(&conn, &mut run, "2026-02-01T00:00:00Z");
+        let live_url = "https://example.com/ordinary?page=2";
+        let endpoint_id = endpoint(&conn, &run, live_url, &["http_probe", "wayback"]);
+        db::save_endpoint_observation(
+            &conn,
+            &run.id,
+            "https://example.com/ordinary?redirect=/account",
+            "wayback",
+            None,
+        )
+        .unwrap();
+        db::classify_scan_inventory(&conn, &run.id).unwrap();
+        fingerprint(&conn, &run, &endpoint_id, "live-page", true, "\"fast\"");
+        let opportunity_id = opportunity(
+            &conn,
+            &run,
+            &endpoint_id,
+            live_url,
+            "RedirectBehavior",
+            "Unverified",
+            Some("no confirmed-live baseline"),
+        );
+        conn.execute(
+            "INSERT INTO opportunity_request_bindings VALUES (?1,?2,'GET','query','redirect',NULL)",
+            params![opportunity_id, run.id.to_string()],
+        )
+        .unwrap();
+
+        let candidate = correlate(&conn, run.id)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.endpoint_id == endpoint_id)
+            .unwrap();
+        let codes: BTreeSet<&str> = candidate
+            .score_reasons
+            .iter()
+            .map(|reason| reason.code.as_str())
+            .collect();
+        assert!(!codes.contains("live_endpoint"));
+        assert!(!codes.contains("complete_fingerprint"));
+        assert!(!codes.contains("provenance:live"));
+        assert!(!codes.contains("parameter:url_redirect"));
+        assert!(!candidate.categories.contains(&"RedirectBehavior".into()));
+        assert_eq!(
+            candidate.suppression_reason.as_deref(),
+            Some("parameter-derived security evidence has no matching live request binding")
         );
     }
 

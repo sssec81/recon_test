@@ -351,12 +351,18 @@ pub fn generate(
             });
             // A category containing parameter evidence is request-shape bound:
             // endpoint-level liveness cannot upgrade a different parameter.
-            let selected_live = if basis.parameters.is_empty() && basis.class_based {
-                live.first().map(|baseline| (baseline, None))
-            } else {
-                matched.map(|(baseline, parameter)| (baseline, Some(parameter)))
-            };
-            let discovered_binding = if selected_live.is_none() {
+            // Prefer an actually live-bound parameter so applicable controls
+            // remain available. Otherwise a structural class keeps its own
+            // endpoint-level basis and is not downgraded by passive parameters.
+            let selected_live = matched
+                .map(|(baseline, parameter)| (baseline, Some(parameter)))
+                .or_else(|| {
+                    basis
+                        .class_based
+                        .then(|| live.first().map(|baseline| (baseline, None)))
+                        .flatten()
+                });
+            let discovered_binding = if selected_live.is_none() && !basis.class_based {
                 basis
                     .parameters
                     .first()
@@ -389,7 +395,11 @@ pub fn generate(
                         "query"
                     }
                     .into(),
-                    parameter: basis.parameters.first().map(|value| value.0.clone()),
+                    parameter: if basis.class_based {
+                        None
+                    } else {
+                        basis.parameters.first().map(|value| value.0.clone())
+                    },
                     live_observation_id: None,
                 }
             };
