@@ -159,6 +159,30 @@ pub struct Args {
     #[arg(long, default_value_t = 6, value_parser = parse_positive_usize)]
     pub sqli_requests_per_parameter: usize,
 
+    /// Run bounded reflected-XSS investigation against live GET query parameters
+    #[arg(long, default_value_t = false)]
+    pub xss_verification: bool,
+
+    /// Run bounded open-redirect investigation against redirect-like GET parameters
+    #[arg(long, default_value_t = false)]
+    pub redirect_verification: bool,
+
+    /// Run bounded file-traversal investigation against path-like GET parameters
+    #[arg(long, default_value_t = false)]
+    pub traversal_verification: bool,
+
+    /// Run bounded CORS investigation with controlled Origin headers
+    #[arg(long, default_value_t = false)]
+    pub cors_verification: bool,
+
+    /// Run bounded SSRF investigation using non-routable and loopback destinations
+    #[arg(long, default_value_t = false)]
+    pub ssrf_verification: bool,
+
+    /// Maximum parameters or endpoints checked by each Phase 9 web verifier
+    #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
+    pub web_verification_max_candidates: usize,
+
     /// Maximum Phase 4 candidates shown and exported in the primary review queue
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub review_max_candidates: usize,

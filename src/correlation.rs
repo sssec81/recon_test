@@ -159,6 +159,7 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
         let bound_parameter_names: BTreeSet<&str> = item
             .opportunities
             .iter()
+            .filter(|opportunity| opportunity.suppression.is_none())
             .filter(|opportunity| opportunity.live_request_bound)
             .filter_map(|opportunity| opportunity.bound_parameter.as_deref())
             .collect();
@@ -174,7 +175,8 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
             item.opportunities
                 .iter()
                 .filter(|opportunity| {
-                    opportunity.bound_parameter.is_none() || opportunity.live_request_bound
+                    opportunity.suppression.is_none()
+                        && (opportunity.bound_parameter.is_none() || opportunity.live_request_bound)
                 })
                 .map(|opportunity| opportunity.category.clone()),
         );
@@ -183,6 +185,7 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
         let strongest = item
             .opportunities
             .iter()
+            .filter(|opportunity| opportunity.suppression.is_none())
             .map(|opportunity| opportunity.state)
             .max()
             .unwrap_or(if item.live {
@@ -229,6 +232,7 @@ pub fn correlate(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<Corre
         let opportunity_ids: Vec<String> = item
             .opportunities
             .iter()
+            .filter(|opportunity| opportunity.suppression.is_none())
             .map(|opportunity| opportunity.id.clone())
             .collect();
         let suppression_reason = suppression(
@@ -861,6 +865,21 @@ fn guidance(categories: &[String]) -> Vec<String> {
             "FileOrPathHandling" => "Review file and path handling manually within program rules.",
             "SqlInjectionBehavior" => {
                 "Review the repeatable database-error differential manually; SQL injection is not confirmed."
+            }
+            "ReflectedXssBehavior" => {
+                "Review the unescaped reflection context manually; script execution was not attempted."
+            }
+            "OpenRedirectBehavior" => {
+                "Review the blocked external Location response manually; no out-of-scope destination was contacted."
+            }
+            "PathTraversalBehavior" => {
+                "Review the repeated file-signature differential manually within program rules."
+            }
+            "CorsBehavior" => {
+                "Review credentialed hostile-Origin behavior and affected data manually."
+            }
+            "SsrfBehavior" => {
+                "Review the reserved/loopback fetch differential manually; outbound access was not confirmed."
             }
             _ => "Review the correlated behavior manually within program rules.",
         };

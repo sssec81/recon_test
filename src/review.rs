@@ -592,6 +592,29 @@ fn not_established(categories: &[String]) -> Vec<String> {
                     "Backend query execution and exploitability were not established.".into(),
                 );
             }
+            "ReflectedXssBehavior" => {
+                values.insert(
+                    "Browser script execution and exploitable HTML context were not established."
+                        .into(),
+                );
+            }
+            "OpenRedirectBehavior" => {
+                values.insert("External navigation impact was not established; the destination was not contacted.".into());
+            }
+            "PathTraversalBehavior" => {
+                values.insert(
+                    "Arbitrary file access beyond the repeated signature was not established."
+                        .into(),
+                );
+            }
+            "CorsBehavior" => {
+                values.insert(
+                    "Exposure of sensitive credentialed response data was not established.".into(),
+                );
+            }
+            "SsrfBehavior" => {
+                values.insert("Outbound server-side network access was not established.".into());
+            }
             _ => {}
         }
     }
@@ -690,6 +713,21 @@ fn manual_guidance(categories: &[String]) -> Vec<String> {
             "SqlInjectionBehavior" => {
                 "Reproduce the paired database-error differential manually on the authorized target; do not infer data access from this signal alone."
             }
+            "ReflectedXssBehavior" => {
+                "Confirm the HTML context and browser behavior manually without escalating the payload."
+            }
+            "OpenRedirectBehavior" => {
+                "Confirm destination validation manually; the scanner did not contact the external destination."
+            }
+            "PathTraversalBehavior" => {
+                "Confirm path normalization and file-boundary behavior manually within authorization."
+            }
+            "CorsBehavior" => {
+                "Confirm whether credentialed cross-origin reads expose sensitive data."
+            }
+            "SsrfBehavior" => {
+                "Use an authorized callback service to confirm outbound server behavior manually."
+            }
             _ => "Review the correlated behavior manually within program rules.",
         };
         values.insert(guidance.to_string());
@@ -778,8 +816,26 @@ fn safe_category(value: &str) -> String {
 
 fn safe_attempt_type(value: &str) -> String {
     match value {
-        "repeat" | "control" | "sqli_repeat" | "sqli_control" | "sqli_quote"
-        | "sqli_boolean_true" | "sqli_boolean_false" => value.into(),
+        "repeat"
+        | "control"
+        | "sqli_repeat"
+        | "sqli_control"
+        | "sqli_quote"
+        | "sqli_boolean_true"
+        | "sqli_boolean_false"
+        | "xss_repeat"
+        | "xss_control"
+        | "xss_markup"
+        | "redirect_repeat"
+        | "redirect_external"
+        | "traversal_repeat"
+        | "traversal_control"
+        | "traversal_probe"
+        | "cors_hostile_origin"
+        | "cors_null_origin"
+        | "ssrf_repeat"
+        | "ssrf_reserved"
+        | "ssrf_loopback" => value.into(),
         _ => "verification".into(),
     }
 }

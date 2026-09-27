@@ -9,6 +9,7 @@ mod sqli;
 mod storage;
 mod triage;
 mod verification;
+mod web_verification;
 
 use clap::Parser;
 

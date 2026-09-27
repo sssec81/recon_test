@@ -35,6 +35,16 @@ fn sqli_request_budget(enabled: bool, max_parameters: usize, requests: usize) ->
     }
 }
 
+fn web_verification_budget(args: &Args) -> usize {
+    let per_candidate = usize::from(args.xss_verification) * 3
+        + usize::from(args.redirect_verification) * 2
+        + usize::from(args.traversal_verification) * 4
+        + usize::from(args.cors_verification) * 2
+        + usize::from(args.ssrf_verification) * 3;
+    args.web_verification_max_candidates
+        .saturating_mul(per_candidate)
+}
+
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting Async Recon Engine v1.0.0...");
 
@@ -98,7 +108,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     seed_hosts.sort();
     seed_hosts.dedup();
     let config = format!(
-        "v3;passive={};scheme={:?};ports={:?};seeds={:?};triage={};triage_depth={};triage_pages={};triage_requests={};verification={};sqli={};sqli_parameters={};sqli_requests={}",
+        "v3;passive={};scheme={:?};ports={:?};seeds={:?};triage={};triage_depth={};triage_pages={};triage_requests={};verification={};sqli={};sqli_parameters={};sqli_requests={};xss={};redirect={};traversal={};cors={};ssrf={};web_candidates={}",
         args.passive,
         args.scheme_strategy,
         crate::probes::services::DEFAULT_PORTS,
@@ -110,7 +120,13 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.controlled_verification,
         args.sqli_verification,
         args.sqli_max_parameters,
-        args.sqli_requests_per_parameter.min(6)
+        args.sqli_requests_per_parameter.min(6),
+        args.xss_verification,
+        args.redirect_verification,
+        args.traversal_verification,
+        args.cors_verification,
+        args.ssrf_verification,
+        args.web_verification_max_candidates
     );
     let config_hash = format!("{:x}", Sha256::digest(config.as_bytes()));
 
@@ -133,6 +149,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.sqli_max_parameters,
         args.sqli_requests_per_parameter,
     );
+    let web_verification_budget = web_verification_budget(&args);
     let target_scheduler = RequestScheduler::new(
         probe_client.clone(),
         scope_policy.clone(),
@@ -140,6 +157,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.triage_max_requests
             .saturating_add(verification_budget)
             .saturating_add(sqli_budget)
+            .saturating_add(web_verification_budget)
             .saturating_add(args.max_targets.saturating_mul(8)),
         20,
         5,
@@ -395,6 +413,28 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     }
+    if args.xss_verification
+        || args.redirect_verification
+        || args.traversal_verification
+        || args.cors_verification
+        || args.ssrf_verification
+    {
+        crate::web_verification::run(
+            scan_context.target_http.as_ref(),
+            &scan_context.scope,
+            &conn,
+            scan_run.id,
+            crate::web_verification::WebVerificationConfig {
+                xss: args.xss_verification,
+                redirect: args.redirect_verification,
+                traversal: args.traversal_verification,
+                cors: args.cors_verification,
+                ssrf: args.ssrf_verification,
+                max_candidates: args.web_verification_max_candidates,
+            },
+        )
+        .await?;
+    }
 
     crate::correlation::run(
         &conn,
@@ -472,7 +512,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sqli_request_budget, verification_request_budget};
+    use super::{sqli_request_budget, verification_request_budget, web_verification_budget};
+    use crate::cli::Args;
+    use clap::Parser;
 
     #[test]
     fn verification_budget_is_added_only_when_enabled() {
@@ -486,5 +528,25 @@ mod tests {
         assert_eq!(sqli_request_budget(false, 5, 6), 0);
         assert_eq!(sqli_request_budget(true, 5, 6), 30);
         assert_eq!(sqli_request_budget(true, 5, 99), 30);
+    }
+
+    #[test]
+    fn web_verifier_budget_is_zero_when_disabled_and_exact_when_enabled() {
+        let disabled = Args::try_parse_from(["recon_test", "--target", "example.com"]).unwrap();
+        assert_eq!(web_verification_budget(&disabled), 0);
+        let enabled = Args::try_parse_from([
+            "recon_test",
+            "--target",
+            "example.com",
+            "--xss-verification",
+            "--redirect-verification",
+            "--traversal-verification",
+            "--cors-verification",
+            "--ssrf-verification",
+            "--web-verification-max-candidates",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(web_verification_budget(&enabled), 28);
     }
 }

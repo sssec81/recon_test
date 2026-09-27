@@ -124,14 +124,26 @@ pub async fn run(
         let repeatable_error = quotes.len() == 2
             && quotes.iter().all(|result| result.database_error)
             && quotes[0].fingerprint.status == quotes[1].fingerprint.status;
+        let boolean_signal = results
+            .get(4)
+            .and_then(|(_, result)| result.as_ref())
+            .zip(results.get(5).and_then(|(_, result)| result.as_ref()))
+            .is_some_and(|(true_result, false_result)| {
+                !true_result.database_error
+                    && !false_result.database_error
+                    && materially_equal(&candidate.baseline, &true_result.fingerprint)
+                    && !materially_equal(&true_result.fingerprint, &false_result.fingerprint)
+                    && true_result.fingerprint.status < 500
+                    && false_result.fingerprint.status < 500
+            });
 
-        if repeat_stable && control_clean && repeatable_error {
+        if repeat_stable && control_clean && (repeatable_error || boolean_signal) {
             conn.execute(
                 "UPDATE investigation_opportunities SET evidence_state='ControlVerified',suppression_reason=NULL WHERE id=?1",
                 params![opportunity_id],
             )?;
             conn.execute(
-                "UPDATE verification_attempts SET comparison=CASE WHEN request_type='sqli_repeat' THEN 'stable' WHEN request_type='sqli_quote' THEN 'meaningfully_different' ELSE comparison END WHERE opportunity_id=?1",
+                "UPDATE verification_attempts SET comparison=CASE WHEN request_type='sqli_repeat' THEN 'stable' WHEN request_type='sqli_quote' THEN 'meaningfully_different' WHEN request_type='sqli_boolean_true' THEN 'stable' WHEN request_type='sqli_boolean_false' THEN 'meaningfully_different' ELSE comparison END WHERE opportunity_id=?1",
                 params![opportunity_id],
             )?;
             survived += 1;

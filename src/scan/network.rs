@@ -333,6 +333,23 @@ impl RequestScheduler {
         &self,
         url: &Url,
     ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_one_with_headers(url, reqwest::header::HeaderMap::new())
+            .await
+    }
+
+    pub async fn get_with_headers(
+        &self,
+        url: &Url,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_one_with_headers(url, headers).await
+    }
+
+    async fn get_one_with_headers(
+        &self,
+        url: &Url,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
         if !self.scope.allows_redirect_url(url) {
             return Err(RequestError::OutOfScope.into());
         }
@@ -373,7 +390,7 @@ impl RequestScheduler {
             }
         }
         self.contacts.fetch_add(1, Ordering::SeqCst);
-        Ok(self.client.get(url.clone()).send().await?)
+        Ok(self.client.get(url.clone()).headers(headers).send().await?)
     }
 
     pub fn contacts(&self) -> usize {
