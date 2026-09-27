@@ -147,6 +147,18 @@ pub struct Args {
     #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
     pub verification_requests_per_opportunity: usize,
 
+    /// Run bounded SQL-injection investigation against live GET query parameters
+    #[arg(long, default_value_t = false)]
+    pub sqli_verification: bool,
+
+    /// Maximum live query parameters checked by the SQL verifier
+    #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
+    pub sqli_max_parameters: usize,
+
+    /// Requests per SQL parameter (hard-capped at 6)
+    #[arg(long, default_value_t = 6, value_parser = parse_positive_usize)]
+    pub sqli_requests_per_parameter: usize,
+
     /// Maximum Phase 4 candidates shown and exported in the primary review queue
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub review_max_candidates: usize,

@@ -27,6 +27,14 @@ fn verification_request_budget(enabled: bool, max_opportunities: usize, requests
     }
 }
 
+fn sqli_request_budget(enabled: bool, max_parameters: usize, requests: usize) -> usize {
+    if enabled {
+        max_parameters.saturating_mul(requests.min(6))
+    } else {
+        0
+    }
+}
+
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting Async Recon Engine v1.0.0...");
 
@@ -90,7 +98,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     seed_hosts.sort();
     seed_hosts.dedup();
     let config = format!(
-        "v3;passive={};scheme={:?};ports={:?};seeds={:?};triage={};triage_depth={};triage_pages={};triage_requests={};verification={}",
+        "v3;passive={};scheme={:?};ports={:?};seeds={:?};triage={};triage_depth={};triage_pages={};triage_requests={};verification={};sqli={};sqli_parameters={};sqli_requests={}",
         args.passive,
         args.scheme_strategy,
         crate::probes::services::DEFAULT_PORTS,
@@ -99,7 +107,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.triage_max_depth,
         args.triage_max_pages,
         args.triage_max_requests,
-        args.controlled_verification
+        args.controlled_verification,
+        args.sqli_verification,
+        args.sqli_max_parameters,
+        args.sqli_requests_per_parameter.min(6)
     );
     let config_hash = format!("{:x}", Sha256::digest(config.as_bytes()));
 
@@ -117,12 +128,18 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.verification_max_opportunities,
         args.verification_requests_per_opportunity,
     );
+    let sqli_budget = sqli_request_budget(
+        args.sqli_verification,
+        args.sqli_max_parameters,
+        args.sqli_requests_per_parameter,
+    );
     let target_scheduler = RequestScheduler::new(
         probe_client.clone(),
         scope_policy.clone(),
         args.concurrency,
         args.triage_max_requests
             .saturating_add(verification_budget)
+            .saturating_add(sqli_budget)
             .saturating_add(args.max_targets.saturating_mul(8)),
         20,
         5,
@@ -365,6 +382,19 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     }
+    if args.sqli_verification {
+        crate::sqli::run(
+            scan_context.target_http.as_ref(),
+            &scan_context.scope,
+            &conn,
+            scan_run.id,
+            crate::sqli::SqlInjectionConfig {
+                max_parameters: args.sqli_max_parameters,
+                max_requests_per_parameter: args.sqli_requests_per_parameter.min(6),
+            },
+        )
+        .await?;
+    }
 
     crate::correlation::run(
         &conn,
@@ -442,12 +472,19 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::verification_request_budget;
+    use super::{sqli_request_budget, verification_request_budget};
 
     #[test]
     fn verification_budget_is_added_only_when_enabled() {
         assert_eq!(verification_request_budget(false, 10, 2), 0);
         assert_eq!(verification_request_budget(true, 10, 2), 20);
         assert_eq!(verification_request_budget(true, 10, 99), 20);
+    }
+
+    #[test]
+    fn sqli_budget_is_added_only_when_enabled_and_hard_capped() {
+        assert_eq!(sqli_request_budget(false, 5, 6), 0);
+        assert_eq!(sqli_request_budget(true, 5, 6), 30);
+        assert_eq!(sqli_request_budget(true, 5, 99), 30);
     }
 }

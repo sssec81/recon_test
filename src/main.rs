@@ -5,6 +5,7 @@ mod probes;
 mod report;
 mod review;
 mod scan;
+mod sqli;
 mod storage;
 mod triage;
 mod verification;

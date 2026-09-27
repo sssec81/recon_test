@@ -461,6 +461,14 @@ fn verification_review(
                     "The benign control was materially indistinguishable from the repeated response."
                         .into(),
                 ),
+                ("sqli_repeat", "stable") => narrative.push(
+                    "The original live query response repeated stably before SQL controls."
+                        .into(),
+                ),
+                ("sqli_quote", "meaningfully_different") => narrative.push(
+                    "Two bounded quote probes reproduced a database-specific error differential."
+                        .into(),
+                ),
                 (_, "inconclusive") => narrative.push(format!(
                     "The {} attempt was inconclusive: {}.",
                     attempt.request_type, attempt.outcome
@@ -555,6 +563,7 @@ fn not_established(categories: &[String]) -> Vec<String> {
         "Vulnerability severity was not established.".to_string(),
         "No vulnerability was confirmed by the scanner.".to_string(),
     ]);
+    let sql_testing_performed = categories.contains(&"SqlInjectionBehavior".to_string());
     for category in categories {
         match category.as_str() {
             "IdentifierHandling" => {
@@ -575,8 +584,13 @@ fn not_established(categories: &[String]) -> Vec<String> {
             "UrlHandling" => {
                 values.insert("Whether URL-like input causes security-sensitive outbound behavior was not established.".into());
             }
-            "SearchSurface" => {
+            "SearchSurface" if !sql_testing_performed => {
                 values.insert("No injection testing was performed.".into());
+            }
+            "SqlInjectionBehavior" => {
+                values.insert(
+                    "Backend query execution and exploitability were not established.".into(),
+                );
             }
             _ => {}
         }
@@ -633,7 +647,11 @@ fn limitations(candidate: &CandidateReview, history_available: bool) -> Vec<Stri
 
 fn manual_guidance(categories: &[String]) -> Vec<String> {
     let mut values = BTreeSet::new();
+    let sql_testing_performed = categories.contains(&"SqlInjectionBehavior".to_string());
     for category in categories {
+        if category == "SearchSurface" && sql_testing_performed {
+            continue;
+        }
         let guidance = match category.as_str() {
             "IdentifierHandling" => {
                 "Use authorized test accounts or resources to compare ownership and server-side authorization manually."
@@ -668,6 +686,9 @@ fn manual_guidance(categories: &[String]) -> Vec<String> {
             "DownloadSurface" => "Review authorization and object or file ownership manually.",
             "SearchSurface" => {
                 "Review how input affects backend behavior manually; the scanner performed no injection testing."
+            }
+            "SqlInjectionBehavior" => {
+                "Reproduce the paired database-error differential manually on the authorized target; do not infer data access from this signal alone."
             }
             _ => "Review the correlated behavior manually within program rules.",
         };
@@ -757,14 +778,15 @@ fn safe_category(value: &str) -> String {
 
 fn safe_attempt_type(value: &str) -> String {
     match value {
-        "repeat" | "control" => value.into(),
+        "repeat" | "control" | "sqli_repeat" | "sqli_control" | "sqli_quote"
+        | "sqli_boolean_true" | "sqli_boolean_false" => value.into(),
         _ => "verification".into(),
     }
 }
 
 fn safe_comparison(value: &str) -> String {
     match value {
-        "stable" | "meaningfully_different" | "inconclusive" => value.into(),
+        "stable" | "meaningfully_different" | "inconclusive" | "observed" => value.into(),
         _ => "inconclusive".into(),
     }
 }

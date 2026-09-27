@@ -859,6 +859,9 @@ fn guidance(categories: &[String]) -> Vec<String> {
             "DebugOrInternalSurface" => "Review exposed functionality and data manually.",
             "AuthenticationSurface" => "Review authentication and session behavior manually.",
             "FileOrPathHandling" => "Review file and path handling manually within program rules.",
+            "SqlInjectionBehavior" => {
+                "Review the repeatable database-error differential manually; SQL injection is not confirmed."
+            }
             _ => "Review the correlated behavior manually within program rules.",
         };
         result.insert(guidance.to_string());
