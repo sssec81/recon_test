@@ -274,26 +274,35 @@ pub fn is_content_route(canonical_url: &str) -> bool {
 }
 
 fn is_content_url(url: &reqwest::Url) -> bool {
-    path_segments(url).any(|segment| {
-        matches!(
-            segment.as_str(),
-            "article"
-                | "articles"
-                | "blog"
-                | "blogs"
-                | "category"
-                | "categories"
-                | "docs"
-                | "documentation"
-                | "help"
-                | "hc"
-                | "kb"
-                | "news"
-                | "section"
-                | "sections"
-                | "support"
-        )
-    })
+    url.host_str()
+        .is_some_and(|host| host.split('.').any(is_content_token))
+        || path_segments(url).any(|segment| is_content_token(&segment))
+}
+
+fn is_content_token(token: &str) -> bool {
+    matches!(
+        token,
+        "article"
+            | "articles"
+            | "api-docs"
+            | "blog"
+            | "blogs"
+            | "category"
+            | "categories"
+            | "developer-docs"
+            | "docs"
+            | "documentation"
+            | "help"
+            | "help-center"
+            | "hc"
+            | "kb"
+            | "knowledge-base"
+            | "news"
+            | "section"
+            | "sections"
+            | "support"
+            | "support-center"
+    )
 }
 
 /// Infer a path identifier only when it follows a resource collection with
@@ -457,6 +466,17 @@ mod tests {
             endpoint_classes("https://example.com/help/file-upload"),
             BTreeSet::from(["Unknown"])
         );
+        for url in [
+            "https://docs.example.com/graphql",
+            "https://support.example.com/login",
+            "https://help.example.com/download",
+            "https://example.com/api-docs",
+            "https://example.com/developer-docs",
+            "https://example.com/help-center",
+            "https://example.com/knowledge-base",
+        ] {
+            assert!(is_content_route(url), "{url}");
+        }
     }
 
     #[test]

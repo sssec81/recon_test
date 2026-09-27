@@ -89,6 +89,30 @@ pub struct InvestigationOpportunity {
     baseline_observation_id: Option<String>,
     baseline: Option<ResponseFingerprint>,
     control_parameter: Option<(String, String)>,
+    request_binding: RequestBinding,
+}
+
+#[derive(Debug, Clone)]
+struct RequestBinding {
+    method: String,
+    location: String,
+    parameter: Option<String>,
+    live_observation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveBaseline {
+    url: String,
+    observation_id: String,
+    fingerprint: ResponseFingerprint,
+    query_parameters: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct CategoryBasis {
+    class_reasons: Vec<String>,
+    class_based: bool,
+    parameters: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,10 +307,8 @@ pub fn generate(
         {
             continue;
         }
-        let live: Option<(String, String, ResponseFingerprint)> = conn.query_row(
-            "SELECT h.url,h.id,f.status,f.body_length,f.captured_length,f.body_complete,f.raw_hash,f.normalized_hash,f.content_type,f.header_hash,f.redirect_target,f.json_shape_hash,f.timing_bucket FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id WHERE h.scan_id=?1 AND f.endpoint_id=?2 AND f.body_complete=1 AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=h.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY h.observed_at,h.id LIMIT 1",
-            params![scan, endpoint_id], |row| Ok((row.get(0)?, row.get(1)?, fingerprint_row(row, 2)?))).optional()?;
-        let mut categories: BTreeMap<OpportunityCategory, Vec<String>> = BTreeMap::new();
+        let live = live_baselines(conn, &scan, &endpoint_id)?;
+        let mut categories: BTreeMap<OpportunityCategory, CategoryBasis> = BTreeMap::new();
         for class in &classes {
             let category = match class.as_str() {
                 "Authentication" => Some(OpportunityCategory::AuthenticationSurface),
@@ -301,9 +323,10 @@ pub fn generate(
                 _ => None,
             };
             if let Some(category) = category {
-                categories
-                    .entry(category)
-                    .or_default()
+                let basis = categories.entry(category).or_default();
+                basis.class_based = true;
+                basis
+                    .class_reasons
                     .push(format!("endpoint class `{class}`"));
             }
         }
@@ -317,39 +340,96 @@ pub fn generate(
                 "Search" | "Query" => OpportunityCategory::SearchSurface,
                 _ => continue,
             };
-            categories
-                .entry(category)
-                .or_default()
-                .push(format!("parameter `{name}` classified {semantic}"));
+            let basis = categories.entry(category).or_default();
+            basis.parameters.push((name.clone(), semantic.clone()));
         }
-        for (category, reasons) in categories {
-            let evidence_state = if live.is_some() {
+        for (category, basis) in categories {
+            let matched = basis.parameters.iter().find_map(|parameter| {
+                live.iter()
+                    .find(|baseline| baseline.query_parameters.contains(&parameter.0))
+                    .map(|baseline| (baseline, parameter))
+            });
+            // A category containing parameter evidence is request-shape bound:
+            // endpoint-level liveness cannot upgrade a different parameter.
+            let selected_live = if basis.parameters.is_empty() && basis.class_based {
+                live.first().map(|baseline| (baseline, None))
+            } else {
+                matched.map(|(baseline, parameter)| (baseline, Some(parameter)))
+            };
+            let discovered_binding = if selected_live.is_none() {
+                basis
+                    .parameters
+                    .first()
+                    .map(|parameter| request_shape(conn, &scan, &endpoint_id, &parameter.0))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let request_binding = if let Some((baseline, parameter)) = selected_live {
+                RequestBinding {
+                    method: "GET".into(),
+                    location: if parameter.is_some() {
+                        "query"
+                    } else {
+                        "endpoint"
+                    }
+                    .into(),
+                    parameter: parameter.map(|value| value.0.clone()),
+                    live_observation_id: Some(baseline.observation_id.clone()),
+                }
+            } else if let Some(binding) = discovered_binding {
+                binding
+            } else {
+                RequestBinding {
+                    method: "GET".into(),
+                    location: if basis.parameters.is_empty() {
+                        "endpoint"
+                    } else {
+                        "query"
+                    }
+                    .into(),
+                    parameter: basis.parameters.first().map(|value| value.0.clone()),
+                    live_observation_id: None,
+                }
+            };
+            let evidence_state = if selected_live.is_some() {
                 EvidenceState::Observed
             } else {
                 EvidenceState::Unverified
             };
-            let priority = priority(category, sources.len(), live.is_some());
+            let priority = priority(category, sources.len(), selected_live.is_some());
             let id = stable_id(&format!("{scan}:{endpoint_id}:{}", category.as_str()));
-            let control_parameter = parameters
-                .iter()
-                .find(|(_, semantic)| matches!(semantic.as_str(), "Redirect" | "Search" | "Query"))
+            let control_parameter = selected_live
+                .and_then(|(_, parameter)| parameter)
+                .filter(|(_, semantic)| {
+                    matches!(semantic.as_str(), "Redirect" | "Search" | "Query")
+                })
                 .cloned();
+            let reason = request_binding
+                .parameter
+                .as_ref()
+                .and_then(|selected| basis.parameters.iter().find(|(name, _)| name == selected))
+                .map(|(name, semantic)| format!("parameter `{name}` classified {semantic}"))
+                .unwrap_or_else(|| basis.class_reasons.join("; "));
             result.push(InvestigationOpportunity {
                 id,
                 endpoint_id: endpoint_id.clone(),
                 canonical_url: canonical_url.clone(),
                 category,
-                reason: reasons.join("; "),
+                reason,
                 supporting_evidence: sources
                     .iter()
                     .map(|source| format!("provenance:{source}"))
                     .collect(),
                 priority,
                 evidence_state,
-                live_url: live.as_ref().map(|v| v.0.clone()),
-                baseline_observation_id: live.as_ref().map(|v| v.1.clone()),
-                baseline: live.as_ref().map(|v| v.2.clone()),
+                live_url: selected_live.map(|(baseline, _)| baseline.url.clone()),
+                baseline_observation_id: selected_live
+                    .map(|(baseline, _)| baseline.observation_id.clone()),
+                baseline: selected_live.map(|(baseline, _)| baseline.fingerprint.clone()),
                 control_parameter,
+                request_binding,
             });
         }
     }
@@ -362,6 +442,53 @@ pub fn generate(
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(result)
+}
+
+fn live_baselines(
+    conn: &Connection,
+    scan: &str,
+    endpoint_id: &str,
+) -> rusqlite::Result<Vec<LiveBaseline>> {
+    let mut statement = conn.prepare(
+        "SELECT h.url,h.id,f.status,f.body_length,f.captured_length,f.body_complete,f.raw_hash,f.normalized_hash,f.content_type,f.header_hash,f.redirect_target,f.json_shape_hash,f.timing_bucket FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id WHERE h.scan_id=?1 AND f.endpoint_id=?2 AND f.body_complete=1 AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=h.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY h.observed_at,h.id",
+    )?;
+    statement
+        .query_map(params![scan, endpoint_id], |row| {
+            let url: String = row.get(0)?;
+            let query_parameters = Url::parse(&url)
+                .ok()
+                .map(|url| {
+                    url.query_pairs()
+                        .map(|(name, _)| name.into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(LiveBaseline {
+                url,
+                observation_id: row.get(1)?,
+                fingerprint: fingerprint_row(row, 2)?,
+                query_parameters,
+            })
+        })?
+        .collect()
+}
+
+fn request_shape(
+    conn: &Connection,
+    scan: &str,
+    endpoint_id: &str,
+    parameter: &str,
+) -> rusqlite::Result<Option<RequestBinding>> {
+    conn.query_row(
+        "SELECT upper(method),parameter_location FROM endpoint_request_shapes WHERE scan_id=?1 AND endpoint_id=?2 AND parameter_name=?3 ORDER BY CASE upper(method) WHEN 'POST' THEN 0 WHEN 'PUT' THEN 1 WHEN 'PATCH' THEN 2 WHEN 'DELETE' THEN 3 WHEN 'GET' THEN 4 ELSE 5 END,source,parameter_location LIMIT 1",
+        params![scan, endpoint_id, parameter],
+        |row| Ok(RequestBinding {
+            method: row.get(0)?,
+            location: row.get(1)?,
+            parameter: Some(parameter.to_string()),
+            live_observation_id: None,
+        }),
+    ).optional()
 }
 
 fn priority(category: OpportunityCategory, source_count: usize, live: bool) -> u8 {
@@ -452,6 +579,10 @@ fn persist_opportunities(
     opportunities: &[InvestigationOpportunity],
 ) -> rusqlite::Result<()> {
     conn.execute(
+        "DELETE FROM opportunity_request_bindings WHERE scan_id=?1",
+        params![scan_id.to_string()],
+    )?;
+    conn.execute(
         "DELETE FROM verification_attempts WHERE scan_id=?1",
         params![scan_id.to_string()],
     )?;
@@ -461,6 +592,17 @@ fn persist_opportunities(
     )?;
     for item in opportunities {
         conn.execute("INSERT INTO investigation_opportunities (id,scan_id,endpoint_id,canonical_url,category,reason,supporting_evidence,priority,evidence_state,suppression_reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)", params![item.id, scan_id.to_string(), item.endpoint_id, item.canonical_url, item.category.as_str(), item.reason, serde_json::to_string(&item.supporting_evidence).unwrap_or_default(), item.priority, item.evidence_state.as_str()])?;
+        conn.execute(
+            "INSERT INTO opportunity_request_bindings (opportunity_id,scan_id,method,parameter_location,parameter_name,live_observation_id) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                item.id,
+                scan_id.to_string(),
+                item.request_binding.method,
+                item.request_binding.location,
+                item.request_binding.parameter,
+                item.request_binding.live_observation_id
+            ],
+        )?;
     }
     Ok(())
 }
@@ -725,6 +867,20 @@ mod tests {
                 .unwrap(),
         );
         conn.execute(
+            "INSERT INTO endpoint_request_shapes VALUES (?1,?2,'UNKNOWN','javascript_call','unknown','')",
+            params![scan.id.to_string(), graphql_endpoint],
+        )
+        .unwrap();
+        assert!(
+            !db::has_independent_functional_evidence(
+                &conn,
+                &scan.id.to_string(),
+                &graphql_endpoint
+            )
+            .unwrap()
+        );
+        assert!(generate(&conn, scan.id).unwrap().is_empty());
+        conn.execute(
             "INSERT INTO endpoint_request_shapes VALUES (?1,?2,'POST','javascript_call','json','query')",
             params![scan.id.to_string(), graphql_endpoint],
         )
@@ -735,6 +891,102 @@ mod tests {
             opportunity.endpoint_id == graphql_endpoint
                 && opportunity.category == OpportunityCategory::GraphQLSurface
         }));
+    }
+
+    #[test]
+    fn parameter_opportunities_bind_only_to_matching_live_request_shapes() {
+        let conn = db::init_db(":memory:").unwrap();
+        let scan = ScanRun::new(vec!["example.com".into()], "shape-binding".into());
+        let headers = reqwest::header::HeaderMap::new();
+        let baseline =
+            crate::scan::fingerprint::fingerprint(200, b"ok", 2, true, None, &headers, None);
+
+        seed(&conn, &scan, "https://example.com/search?page=2", &baseline);
+        db::save_endpoint_observation(
+            &conn,
+            &scan.id,
+            "https://example.com/search?redirect=/account",
+            "wayback",
+            None,
+        )
+        .unwrap();
+        db::classify_scan_inventory(&conn, &scan.id).unwrap();
+        let opportunities = generate(&conn, scan.id).unwrap();
+        let redirect = opportunities
+            .iter()
+            .find(|item| item.category == OpportunityCategory::RedirectBehavior)
+            .unwrap();
+        assert_eq!(redirect.evidence_state, EvidenceState::Unverified);
+        assert!(redirect.live_url.is_none());
+        assert_eq!(redirect.request_binding.method, "GET");
+        assert_eq!(redirect.request_binding.location, "query");
+        assert_eq!(
+            redirect.request_binding.parameter.as_deref(),
+            Some("redirect")
+        );
+        assert!(redirect.request_binding.live_observation_id.is_none());
+
+        let lookup = "https://example.com/lookup";
+        db::save_request_shape(
+            &conn,
+            &scan.id,
+            lookup,
+            "POST",
+            "triage_form",
+            "form",
+            "query",
+        )
+        .unwrap();
+        let endpoint = crate::scan::normalize::normalize_endpoint(lookup, None).unwrap();
+        let endpoint_id = crate::scan::normalize::endpoint_id(&endpoint);
+        conn.execute(
+            "INSERT INTO http_observations VALUES ('lookup-live',?1,'example.com',?2,200,NULL,NULL,1,2,'later')",
+            params![scan.id.to_string(), lookup],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO response_fingerprints VALUES ('lookup-live',?1,?2,200,2,2,1,'raw','normalized',NULL,'headers',NULL,NULL,'\"very_fast\"')",
+            params![scan.id.to_string(), endpoint_id],
+        )
+        .unwrap();
+        db::save_endpoint_observation(&conn, &scan.id, lookup, "triage_fetch", None).unwrap();
+        db::classify_scan_inventory(&conn, &scan.id).unwrap();
+        let opportunities = generate(&conn, scan.id).unwrap();
+        let post_search = opportunities
+            .iter()
+            .find(|item| {
+                item.endpoint_id == endpoint_id
+                    && item.category == OpportunityCategory::SearchSurface
+            })
+            .unwrap();
+        assert_eq!(post_search.evidence_state, EvidenceState::Unverified);
+        assert!(post_search.live_url.is_none());
+        assert_eq!(post_search.request_binding.method, "POST");
+        assert_eq!(post_search.request_binding.location, "form");
+        assert_eq!(
+            post_search.request_binding.parameter.as_deref(),
+            Some("query")
+        );
+
+        persist_opportunities(&conn, scan.id, &opportunities).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT method || ':' || parameter_location || ':' || parameter_name FROM opportunity_request_bindings WHERE opportunity_id=?1",
+                params![post_search.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "POST:form:query"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM opportunity_request_bindings WHERE scan_id=?1 AND live_observation_id IS NOT NULL",
+                params![scan.id.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

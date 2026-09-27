@@ -97,6 +97,10 @@ pub struct OpportunityReview {
     pub category: String,
     pub evidence_state: String,
     pub suppression: Option<String>,
+    pub request_method: Option<String>,
+    pub parameter_location: Option<String>,
+    pub parameter_name: Option<String>,
+    pub live_request_bound: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,7 +367,7 @@ fn load_opportunities(
     scan_id: Uuid,
     parts: &mut BTreeMap<String, CandidateParts>,
 ) -> rusqlite::Result<()> {
-    let mut statement = conn.prepare("SELECT co.candidate_id,o.id,o.category,o.evidence_state,o.suppression_reason FROM candidate_opportunities co JOIN correlated_candidates c ON c.id=co.candidate_id JOIN investigation_opportunities o ON o.id=co.opportunity_id WHERE c.scan_id=?1 AND c.rank IS NOT NULL ORDER BY co.candidate_id,o.category,o.id")?;
+    let mut statement = conn.prepare("SELECT co.candidate_id,o.id,o.category,o.evidence_state,o.suppression_reason,b.method,b.parameter_location,b.parameter_name,b.live_observation_id IS NOT NULL FROM candidate_opportunities co JOIN correlated_candidates c ON c.id=co.candidate_id JOIN investigation_opportunities o ON o.id=co.opportunity_id LEFT JOIN opportunity_request_bindings b ON b.opportunity_id=o.id WHERE c.scan_id=?1 AND c.rank IS NOT NULL ORDER BY co.candidate_id,o.category,o.id")?;
     for row in statement.query_map(params![scan_id.to_string()], |row| {
         let suppression: Option<String> = row.get(4)?;
         Ok((
@@ -373,6 +377,10 @@ fn load_opportunities(
                 category: safe_category(&row.get::<_, String>(2)?),
                 evidence_state: safe_state(&row.get::<_, String>(3)?),
                 suppression: suppression.as_deref().map(safe_suppression),
+                request_method: row.get(5)?,
+                parameter_location: row.get(6)?,
+                parameter_name: row.get(7)?,
+                live_request_bound: row.get::<_, Option<bool>>(8)?.unwrap_or(false),
             },
         ))
     })? {
@@ -473,6 +481,23 @@ fn verification_review(
                 .as_deref()
                 .unwrap_or("not completed")
         ));
+    }
+    for opportunity in opportunities {
+        if let (Some(method), Some(location)) = (
+            opportunity.request_method.as_deref(),
+            opportunity.parameter_location.as_deref(),
+        ) {
+            let parameter = opportunity
+                .parameter_name
+                .as_deref()
+                .map(|name| format!(" parameter `{name}`"))
+                .unwrap_or_default();
+            narrative.push(format!(
+                "{} uses the persisted {method} {location}{parameter} request shape; live binding: {}.",
+                opportunity.category,
+                if opportunity.live_request_bound { "yes" } else { "no" }
+            ));
+        }
     }
     if state == "Repeatable"
         && !attempts

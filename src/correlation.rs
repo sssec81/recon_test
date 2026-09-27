@@ -312,7 +312,7 @@ fn load_sets(
         }
     }
     let mut functional = conn.prepare(
-        "SELECT endpoint_id FROM endpoint_request_shapes WHERE scan_id=?1 AND upper(method) NOT IN ('GET','HEAD','OPTIONS') UNION SELECT f.endpoint_id FROM response_fingerprints f WHERE f.scan_id=?1 AND f.body_complete=1 AND (f.json_shape_hash IS NOT NULL OR lower(COALESCE(f.content_type,'')) LIKE '%json%') AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=f.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY endpoint_id",
+        "SELECT endpoint_id FROM endpoint_request_shapes WHERE scan_id=?1 AND upper(method) IN ('POST','PUT','PATCH','DELETE') UNION SELECT f.endpoint_id FROM response_fingerprints f WHERE f.scan_id=?1 AND f.body_complete=1 AND (f.json_shape_hash IS NOT NULL OR lower(COALESCE(f.content_type,'')) LIKE '%json%') AND EXISTS (SELECT 1 FROM endpoint_observations o WHERE o.scan_id=f.scan_id AND o.endpoint_id=f.endpoint_id AND o.source IN ('http_probe','triage_fetch','verification')) ORDER BY endpoint_id",
     )?;
     for row in functional.query_map(params![scan], |row| row.get::<_, String>(0))? {
         if let Some(item) = map.get_mut(&row?) {

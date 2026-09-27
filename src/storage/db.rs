@@ -244,6 +244,13 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             UNIQUE(scan_id, endpoint_id, category),
             FOREIGN KEY(scan_id) REFERENCES scan_runs(id), FOREIGN KEY(endpoint_id) REFERENCES endpoints(id)
         );
+        CREATE TABLE IF NOT EXISTS opportunity_request_bindings (
+            opportunity_id TEXT PRIMARY KEY, scan_id TEXT NOT NULL,
+            method TEXT NOT NULL, parameter_location TEXT NOT NULL,
+            parameter_name TEXT, live_observation_id TEXT,
+            FOREIGN KEY(opportunity_id) REFERENCES investigation_opportunities(id),
+            FOREIGN KEY(scan_id) REFERENCES scan_runs(id)
+        );
         CREATE TABLE IF NOT EXISTS verification_attempts (
             id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
             sequence INTEGER NOT NULL, request_type TEXT NOT NULL,
@@ -666,16 +673,16 @@ pub fn clear_scan_finish(conn: &Connection, scan_run_id: &Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Behavioral evidence independent of URL-derived endpoint classes. This is
-/// intentionally narrow because it is used to exempt content routes from
-/// documentation suppression.
+/// Functional evidence independent of URL-derived endpoint classes. Explicit
+/// stateful request intelligence is weaker than a live JSON response, but both
+/// are narrow enough to escape content suppression; `UNKNOWN` is not.
 pub fn has_independent_functional_evidence(
     conn: &Connection,
     scan_id: &str,
     endpoint_id: &str,
 ) -> Result<bool> {
     let non_get = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM endpoint_request_shapes WHERE scan_id=?1 AND endpoint_id=?2 AND upper(method) NOT IN ('GET','HEAD','OPTIONS'))",
+        "SELECT EXISTS(SELECT 1 FROM endpoint_request_shapes WHERE scan_id=?1 AND endpoint_id=?2 AND upper(method) IN ('POST','PUT','PATCH','DELETE'))",
         params![scan_id, endpoint_id],
         |row| row.get::<_, bool>(0),
     )?;
