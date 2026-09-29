@@ -58,12 +58,13 @@ pub async fn run(
         .await?;
     }
     if config.redirect {
+        let redirect_candidates = eligible_redirect_parameters(conn, scan_id, &candidates)?;
         run_redirect(
             scheduler,
             scope,
             conn,
             scan_id,
-            &candidates,
+            &redirect_candidates,
             config.max_candidates,
         )
         .await?;
@@ -192,6 +193,7 @@ async fn run_redirect(
                     "continue",
                     "dest",
                     "destination",
+                    "to",
                 ],
             )
         })
@@ -203,8 +205,12 @@ async fn run_redirect(
             continue;
         }
         let id = opportunity(conn, scan_id, candidate, "OpenRedirectBehavior", 9)?;
-        let repeat = fetch(scheduler, &candidate.live_url).await;
-        save_attempt(
+        let original_redirect = scheduler
+            .get_with_trace_limited(&candidate.live_url, 1)
+            .await
+            .ok()
+            .is_some_and(|result| result.termination == RedirectTermination::OutOfScope);
+        save_observed_attempt(
             conn,
             scan_id,
             &id,
@@ -212,9 +218,21 @@ async fn run_redirect(
             "redirect_repeat",
             &candidate.live_url,
             candidate,
-            repeat.as_ref(),
+            original_redirect,
         )?;
-        let marker = format!("https://example.invalid/recon-{}", &id[..10]);
+        let original = Url::parse(&candidate.original_value).ok();
+        let marker = if original
+            .as_ref()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        {
+            format!(
+                "https://example.invalid/recon-{}?allowed={}",
+                &id[..10],
+                candidate.original_value
+            )
+        } else {
+            format!("https://example.invalid/recon-{}", &id[..10])
+        };
         let url = replace_query(&candidate.live_url, &candidate.parameter, &marker);
         let redirected = scheduler
             .get_with_trace_limited(&url, 1)
@@ -237,10 +255,7 @@ async fn run_redirect(
             candidate,
             redirected,
         )?;
-        let stable = repeat
-            .as_ref()
-            .is_some_and(|probe| equal(&candidate.baseline, &probe.fingerprint));
-        if stable && redirected {
+        if redirected {
             promote(
                 conn,
                 &id,
@@ -581,6 +596,81 @@ fn eligible_endpoints(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<
             },
         )
         .collect())
+}
+
+fn eligible_redirect_parameters(
+    conn: &Connection,
+    scan_id: Uuid,
+    existing: &[Candidate],
+) -> rusqlite::Result<Vec<Candidate>> {
+    let mut result = existing.to_vec();
+    let mut seen: BTreeSet<(String, String)> = result
+        .iter()
+        .map(|candidate| (candidate.endpoint_id.clone(), candidate.parameter.clone()))
+        .collect();
+    let mut statement = conn.prepare(
+        "SELECT e.id,e.canonical_url,o.raw_url FROM endpoint_observations o JOIN endpoints e ON e.id=o.endpoint_id WHERE o.scan_id=?1 ORDER BY e.canonical_url,o.raw_url",
+    )?;
+    let rows = statement
+        .query_map(params![scan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (endpoint_id, canonical_url, raw_url) in rows {
+        let Ok(url) = Url::parse(&raw_url) else {
+            continue;
+        };
+        for (name, value) in url.query_pairs() {
+            let name = name.into_owned();
+            if !name_matches(
+                &name,
+                &[
+                    "url",
+                    "uri",
+                    "next",
+                    "redirect",
+                    "return",
+                    "continue",
+                    "dest",
+                    "destination",
+                    "to",
+                ],
+            ) || !seen.insert((endpoint_id.clone(), name.clone()))
+            {
+                continue;
+            }
+            result.push(Candidate {
+                endpoint_id: endpoint_id.clone(),
+                canonical_url: canonical_url.clone(),
+                live_url: url.clone(),
+                observation_id: stable_id(&format!("{scan_id}:redirect:{raw_url}")),
+                parameter: name,
+                original_value: value.into_owned(),
+                baseline: placeholder_fingerprint(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn placeholder_fingerprint() -> ResponseFingerprint {
+    ResponseFingerprint {
+        status: 0,
+        body_length: 0,
+        captured_length: 0,
+        body_complete: false,
+        raw_hash: String::new(),
+        normalized_hash: String::new(),
+        content_type: None,
+        header_hash: String::new(),
+        redirect_target: None,
+        json_shape_hash: None,
+        timing_bucket: crate::scan::fingerprint::TimingBucket::Unknown,
+    }
 }
 
 async fn fetch(scheduler: &RequestScheduler, url: &Url) -> Option<Probe> {
@@ -965,6 +1055,66 @@ mod tests {
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(conn.query_row("SELECT evidence_state FROM investigation_opportunities WHERE category='OpenRedirectBehavior'", [], |row| row.get::<_, String>(0)).unwrap(), "ControlVerified");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_verifier_detects_discovered_allowlist_substring_bypass() {
+        fn responder(request: &str) -> TestResponse {
+            let target = request.split_whitespace().nth(1).unwrap();
+            let url = Url::parse(&format!("http://127.0.0.1{target}")).unwrap();
+            let destination = url
+                .query_pairs()
+                .find(|(name, _)| name == "to")
+                .unwrap()
+                .1
+                .into_owned();
+            if destination.contains("https://allowed.example/app") {
+                (
+                    "302 Found".into(),
+                    vec![("Location", destination)],
+                    String::new(),
+                )
+            } else {
+                ("406 Not Acceptable".into(), vec![], "blocked".into())
+            }
+        }
+        let (address, hits, server) = spawn_server(2, responder).await;
+        let mut discovered = Url::parse(&format!("http://{address}/redirect")).unwrap();
+        discovered
+            .query_pairs_mut()
+            .append_pair("to", "https://allowed.example/app");
+        let raw_url = discovered.to_string();
+        let conn = db::init_db(":memory:").unwrap();
+        let scan = ScanRun::new(vec!["127.0.0.1".into()], "redirect-static-test".into());
+        db::save_scan_run(&conn, &scan).unwrap();
+        db::save_endpoint_observation(&conn, &scan.id, &raw_url, "javascript", None).unwrap();
+        let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let scheduler = RequestScheduler::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            1,
+            2,
+            0,
+            0,
+            None,
+        );
+        run(&scheduler, &scope, &conn, scan.id, config("redirect"))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT evidence_state FROM investigation_opportunities WHERE category='OpenRedirectBehavior'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "ControlVerified"
+        );
         server.await.unwrap();
     }
 

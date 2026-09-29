@@ -19,6 +19,8 @@ static XHR_OPEN: LazyLock<Regex> = LazyLock::new(|| {
 });
 static STRING_LITERAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[\"']([^\"'\r\n]{1,300})[\"']"#).unwrap());
+static STATIC_TEMPLATE_LITERAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"`([^`\r\n$]{1,300})`"#).unwrap());
 static WEBSOCKET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)new\s+WebSocket\s*\(\s*[\"']([^\"']{1,300})[\"']"#).unwrap()
 });
@@ -122,6 +124,19 @@ pub fn extract(
         }
     }
     for captures in STRING_LITERAL.captures_iter(script) {
+        if let Some(value) = captures.get(1)
+            && is_likely_route(value.as_str())
+        {
+            push_url_candidate(
+                &mut candidates,
+                "url_literal",
+                value.as_str(),
+                resolution_base,
+                scope,
+            );
+        }
+    }
+    for captures in STATIC_TEMPLATE_LITERAL.captures_iter(script) {
         if let Some(value) = captures.get(1)
             && is_likely_route(value.as_str())
         {
@@ -529,5 +544,31 @@ mod tests {
                         == Some("https://example.com/assets/api/users"))
             );
         }
+    }
+
+    #[test]
+    fn extracts_static_backtick_route_literals() {
+        let scope = ScopePolicy::new(vec!["example.com".into()]);
+        let source = Url::parse("https://example.com/main.js").unwrap();
+        let candidates = extract(
+            "const link = `./redirect?to=https://allowed.example/path`;",
+            &source,
+            &source,
+            &scope,
+        );
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.kind == "url_literal")
+            .unwrap();
+        let resolved = Url::parse(candidate.resolved_url.as_deref().unwrap()).unwrap();
+        assert_eq!(resolved.path(), "/redirect");
+        assert_eq!(
+            resolved
+                .query_pairs()
+                .find(|(name, _)| name == "to")
+                .unwrap()
+                .1,
+            "https://allowed.example/path"
+        );
     }
 }

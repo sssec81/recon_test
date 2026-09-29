@@ -302,7 +302,7 @@ pub fn extract_links(page: &Page, base: &Url, scope: &ScopePolicy) -> Vec<Url> {
         links.extend(
             calls
                 .into_iter()
-                .filter(|(_, method)| method == "GET")
+                .filter(|(url, method)| method == "GET" && !non_get.contains(url.as_str()))
                 .map(|(url, _)| url),
         );
         for captures in API_PATH.captures_iter(&script_text) {
@@ -346,14 +346,43 @@ pub fn extract_js_calls(
 ) -> Vec<(Url, String)> {
     crate::scan::javascript::extract(script, source_url, resolution_base, scope)
         .into_iter()
-        .filter(|candidate| candidate.kind == "http_call")
+        .filter(|candidate| matches!(candidate.kind, "http_call" | "url_literal"))
         .filter_map(|candidate| {
-            Some((
-                Url::parse(candidate.resolved_url.as_deref()?).ok()?,
-                candidate.method.unwrap_or_else(|| "UNKNOWN".into()),
-            ))
+            let url = Url::parse(candidate.resolved_url.as_deref()?).ok()?;
+            if candidate.kind == "url_literal" && !actionable_url_literal(&url) {
+                return None;
+            }
+            Some((url, candidate.method.unwrap_or_else(|| "GET".into())))
         })
         .collect()
+}
+
+fn actionable_url_literal(url: &Url) -> bool {
+    let structural_path = url
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .is_some_and(|segment| matches!(segment, "api" | "rest" | "redirect" | "ftp"));
+    let security_parameter = url.query_pairs().any(|(name, _)| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "q" | "query"
+                | "search"
+                | "url"
+                | "uri"
+                | "to"
+                | "next"
+                | "redirect"
+                | "return"
+                | "continue"
+                | "dest"
+                | "destination"
+                | "file"
+                | "path"
+                | "page"
+                | "template"
+        )
+    });
+    structural_path || security_parameter
 }
 
 pub fn is_javascript_resource(content_type: Option<&str>, resource_url: &Url) -> bool {
@@ -389,6 +418,20 @@ mod tests {
         assert!(is_javascript_resource(
             Some("application/octet-stream"),
             &url
+        ));
+    }
+
+    #[test]
+    fn weak_url_literals_remain_passive_but_structural_literals_can_crawl() {
+        let base = Url::parse("https://example.com/main.js").unwrap();
+        assert!(!actionable_url_literal(
+            &Url::parse("https://example.com/1G").unwrap()
+        ));
+        assert!(actionable_url_literal(
+            &base.join("./redirect?to=https://allowed.example").unwrap()
+        ));
+        assert!(actionable_url_literal(
+            &base.join("/rest/products/search?q=juice").unwrap()
         ));
     }
     #[test]
