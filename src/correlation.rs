@@ -350,7 +350,7 @@ fn load_sets(
             item.independent_functional_evidence = true;
         }
     }
-    let mut opportunities = conn.prepare("SELECT o.id,o.endpoint_id,o.category,o.evidence_state,o.suppression_reason,b.parameter_name,b.live_observation_id IS NOT NULL FROM investigation_opportunities o LEFT JOIN opportunity_request_bindings b ON b.opportunity_id=o.id WHERE o.scan_id=?1 ORDER BY o.endpoint_id,o.category,o.id")?;
+    let mut opportunities = conn.prepare("SELECT o.id,o.endpoint_id,o.category,o.evidence_state,o.suppression_reason,b.parameter_name,EXISTS(SELECT 1 FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id AND f.scan_id=h.scan_id AND f.endpoint_id=o.endpoint_id JOIN endpoint_observations eo ON eo.scan_id=h.scan_id AND eo.endpoint_id=o.endpoint_id AND eo.raw_url=h.url WHERE h.id=b.live_observation_id AND h.scan_id=o.scan_id AND eo.source IN ('http_probe','triage_fetch','verification')) FROM investigation_opportunities o LEFT JOIN opportunity_request_bindings b ON b.opportunity_id=o.id WHERE o.scan_id=?1 ORDER BY o.endpoint_id,o.category,o.id")?;
     for row in opportunities.query_map(params![scan], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1257,7 +1257,7 @@ mod tests {
             Some("no confirmed-live baseline"),
         );
         conn.execute(
-            "INSERT INTO opportunity_request_bindings VALUES (?1,?2,'GET','query','redirect',NULL)",
+            "INSERT INTO opportunity_request_bindings VALUES (?1,?2,'GET','query','redirect','synthetic-observation-id')",
             params![opportunity_id, run.id.to_string()],
         )
         .unwrap();

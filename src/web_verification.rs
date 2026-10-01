@@ -27,7 +27,7 @@ struct Candidate {
     endpoint_id: String,
     canonical_url: String,
     live_url: Url,
-    observation_id: String,
+    observation_id: Option<String>,
     parameter: String,
     original_value: String,
     baseline: ResponseFingerprint,
@@ -205,11 +205,30 @@ async fn run_redirect(
             continue;
         }
         let id = opportunity(conn, scan_id, candidate, "OpenRedirectBehavior", 9)?;
-        let original_redirect = scheduler
+        let original_result = scheduler
             .get_with_trace_limited(&candidate.live_url, 1)
             .await
-            .ok()
+            .ok();
+        let original_redirect = original_result
+            .as_ref()
             .is_some_and(|result| result.termination == RedirectTermination::OutOfScope);
+        let original_consistent = original_result.as_ref().is_some_and(|result| {
+            let expected_redirect =
+                result
+                    .blocked_destination
+                    .as_deref()
+                    .is_some_and(|destination| {
+                        Url::parse(destination)
+                            .ok()
+                            .zip(Url::parse(&candidate.original_value).ok())
+                            .is_some_and(|(actual, expected)| actual == expected)
+                    });
+            expected_redirect
+                || (candidate.observation_id.is_some()
+                    && result.termination == RedirectTermination::FinalResponse
+                    && result.last_status == Some(candidate.baseline.status)
+                    && candidate.baseline.status < 500)
+        });
         save_observed_attempt(
             conn,
             scan_id,
@@ -220,6 +239,15 @@ async fn run_redirect(
             candidate,
             original_redirect,
         )?;
+        if original_consistent && candidate.observation_id.is_none() {
+            bind_verified_redirect_observation(
+                conn,
+                scan_id,
+                &id,
+                candidate,
+                original_result.as_ref(),
+            )?;
+        }
         let original = Url::parse(&candidate.original_value).ok();
         let marker = if original
             .as_ref()
@@ -255,7 +283,7 @@ async fn run_redirect(
             candidate,
             redirected,
         )?;
-        if redirected {
+        if original_consistent && redirected {
             promote(
                 conn,
                 &id,
@@ -267,7 +295,11 @@ async fn run_redirect(
             suppress(
                 conn,
                 &id,
-                "external destination was not returned in a blocked redirect",
+                if !original_consistent {
+                    "original redirect request did not produce a credible successful control"
+                } else {
+                    "external destination was not returned in a blocked redirect"
+                },
             )?;
         }
     }
@@ -553,7 +585,7 @@ fn eligible_parameters(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec
                 endpoint_id: endpoint_id.clone(),
                 canonical_url: canonical_url.clone(),
                 live_url: url.clone(),
-                observation_id: observation_id.clone(),
+                observation_id: Some(observation_id.clone()),
                 parameter: name,
                 original_value: value.into_owned(),
                 baseline: baseline.clone(),
@@ -588,7 +620,7 @@ fn eligible_endpoints(conn: &Connection, scan_id: Uuid) -> rusqlite::Result<Vec<
                     endpoint_id,
                     canonical_url,
                     live_url: Url::parse(&raw_url).ok()?,
-                    observation_id,
+                    observation_id: Some(observation_id),
                     parameter: String::new(),
                     original_value: String::new(),
                     baseline,
@@ -647,7 +679,7 @@ fn eligible_redirect_parameters(
                 endpoint_id: endpoint_id.clone(),
                 canonical_url: canonical_url.clone(),
                 live_url: url.clone(),
-                observation_id: stable_id(&format!("{scan_id}:redirect:{raw_url}")),
+                observation_id: None,
                 parameter: name,
                 original_value: value.into_owned(),
                 baseline: placeholder_fingerprint(),
@@ -671,6 +703,52 @@ fn placeholder_fingerprint() -> ResponseFingerprint {
         json_shape_hash: None,
         timing_bucket: crate::scan::fingerprint::TimingBucket::Unknown,
     }
+}
+
+fn bind_verified_redirect_observation(
+    conn: &Connection,
+    scan_id: Uuid,
+    opportunity_id: &str,
+    candidate: &Candidate,
+    result: Option<&crate::scan::network::ScheduledResponse>,
+) -> rusqlite::Result<()> {
+    let Some(result) = result else {
+        return Ok(());
+    };
+    let status = result.last_status.unwrap_or_default();
+    let raw_url = sanitized_url(&candidate.live_url);
+    let fingerprint = ResponseFingerprint {
+        status,
+        body_length: 0,
+        captured_length: 0,
+        body_complete: false,
+        raw_hash: String::new(),
+        normalized_hash: String::new(),
+        content_type: None,
+        header_hash: String::new(),
+        redirect_target: result.blocked_destination.as_deref().and_then(|value| {
+            Url::parse(value)
+                .ok()
+                .map(|url| format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()))
+        }),
+        json_shape_hash: None,
+        timing_bucket: crate::scan::fingerprint::TimingBucket::Unknown,
+    };
+    crate::storage::db::save_active_http_observation(
+        conn,
+        &scan_id,
+        &raw_url,
+        "verification",
+        status,
+        0,
+        &fingerprint,
+    )?;
+    let observation_id = stable_id(&format!("{scan_id}:verification:{raw_url}"));
+    conn.execute(
+        "UPDATE opportunity_request_bindings SET live_observation_id=?2 WHERE opportunity_id=?1",
+        params![opportunity_id, observation_id],
+    )?;
+    Ok(())
 }
 
 async fn fetch(scheduler: &RequestScheduler, url: &Url) -> Option<Probe> {
@@ -704,7 +782,7 @@ fn opportunity(
                 "query"
             },
             candidate.parameter,
-            candidate.observation_id,
+            candidate.observation_id.as_deref(),
         ],
     )?;
     Ok(id)
@@ -721,7 +799,7 @@ fn save_attempt(
     candidate: &Candidate,
     result: Option<&Probe>,
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT OR REPLACE INTO verification_attempts (id,scan_id,opportunity_id,sequence,request_type,request_url,baseline_observation_id,fingerprint,comparison,failure_reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'observed',?9,?10)", params![stable_id(&format!("{id}:{sequence}")), scan_id.to_string(), id, sequence as i64, kind, sanitized_url(url), candidate.observation_id, result.and_then(|value| serde_json::to_string(&value.fingerprint).ok()), result.is_none().then_some("request failed or shared budget exhausted"), chrono::Utc::now().to_rfc3339()])?;
+    conn.execute("INSERT OR REPLACE INTO verification_attempts (id,scan_id,opportunity_id,sequence,request_type,request_url,baseline_observation_id,fingerprint,comparison,failure_reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'observed',?9,?10)", params![stable_id(&format!("{id}:{sequence}")), scan_id.to_string(), id, sequence as i64, kind, sanitized_url(url), candidate.observation_id.as_deref(), result.and_then(|value| serde_json::to_string(&value.fingerprint).ok()), result.is_none().then_some("request failed or shared budget exhausted"), chrono::Utc::now().to_rfc3339()])?;
     Ok(())
 }
 
@@ -736,7 +814,7 @@ fn save_observed_attempt(
     candidate: &Candidate,
     matched: bool,
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT OR REPLACE INTO verification_attempts (id,scan_id,opportunity_id,sequence,request_type,request_url,baseline_observation_id,fingerprint,comparison,failure_reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,NULL,?9)", params![stable_id(&format!("{id}:{sequence}")), scan_id.to_string(), id, sequence as i64, kind, sanitized_url(url), candidate.observation_id, if matched { "meaningfully_different" } else { "observed" }, chrono::Utc::now().to_rfc3339()])?;
+    conn.execute("INSERT OR REPLACE INTO verification_attempts (id,scan_id,opportunity_id,sequence,request_type,request_url,baseline_observation_id,fingerprint,comparison,failure_reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,NULL,?9)", params![stable_id(&format!("{id}:{sequence}")), scan_id.to_string(), id, sequence as i64, kind, sanitized_url(url), candidate.observation_id.as_deref(), if matched { "meaningfully_different" } else { "observed" }, chrono::Utc::now().to_rfc3339()])?;
     Ok(())
 }
 
@@ -1114,6 +1192,76 @@ mod tests {
             )
             .unwrap(),
             "ControlVerified"
+        );
+        let binding: String = conn
+            .query_row(
+                "SELECT live_observation_id FROM opportunity_request_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM http_observations h JOIN response_fingerprints f ON f.http_observation_id=h.id JOIN endpoint_observations e ON e.scan_id=h.scan_id AND e.endpoint_id=f.endpoint_id AND e.raw_url=h.url WHERE h.id=?1 AND e.source='verification'",
+                params![binding],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_verifier_does_not_promote_after_failed_original_control() {
+        fn responder(request: &str) -> TestResponse {
+            if request.contains("example.invalid") {
+                (
+                    "302 Found".into(),
+                    vec![("Location", "https://example.invalid/recon-proof".into())],
+                    String::new(),
+                )
+            } else {
+                ("500 Internal Server Error".into(), vec![], "failure".into())
+            }
+        }
+        let (address, hits, server) = spawn_server(2, responder).await;
+        let url = format!("http://{address}/go?next=home");
+        let (conn, scan) = fixture(&url, "baseline", "text/plain");
+        let scope = ScopePolicy::new(vec!["127.0.0.1".into()]);
+        let scheduler = RequestScheduler::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            scope.clone(),
+            1,
+            2,
+            0,
+            0,
+            None,
+        );
+        run(&scheduler, &scope, &conn, scan.id, config("redirect"))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT evidence_state FROM investigation_opportunities WHERE category='OpenRedirectBehavior'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Observed"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT suppression_reason FROM investigation_opportunities WHERE category='OpenRedirectBehavior'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .contains("original redirect request")
         );
         server.await.unwrap();
     }
