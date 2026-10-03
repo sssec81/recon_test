@@ -507,7 +507,15 @@ fn verification_review(
             ));
         }
     }
+    let ssrf_differential = categories.contains(&"SsrfBehavior".to_string());
+    if state == "Repeatable" && ssrf_differential {
+        narrative.push(
+            "Reserved-address and loopback probes produced distinct network-error responses; this is a response differential, not callback-confirmed outbound access."
+                .into(),
+        );
+    }
     if state == "Repeatable"
+        && !ssrf_differential
         && !attempts
             .iter()
             .any(|attempt| attempt.request_type == "control")
@@ -625,6 +633,11 @@ fn limitations(candidate: &CandidateReview, history_available: bool) -> Vec<Stri
     let mut values = BTreeSet::new();
     if !candidate.verification.performed {
         values.insert("No controlled verification was performed.".into());
+    } else if candidate.categories.contains(&"SsrfBehavior".to_string()) {
+        values.insert(
+            "SSRF evidence is response-based only; no authorized callback observed a server-originated request."
+                .into(),
+        );
     } else if candidate.evidence_state == "Repeatable"
         && !candidate
             .verification
@@ -1169,6 +1182,7 @@ mod tests {
     fn deterministic_language_does_not_overclaim() {
         let identifier = not_established(&["IdentifierHandling".into()]).join(" ");
         let redirect = not_established(&["RedirectBehavior".into()]).join(" ");
+        let ssrf = not_established(&["SsrfBehavior".into()]).join(" ");
         assert!(!identifier.to_ascii_lowercase().contains("idor confirmed"));
         assert!(
             !identifier
@@ -1182,6 +1196,12 @@ mod tests {
         );
         assert!(identifier.contains("No vulnerability was confirmed"));
         assert!(redirect.contains("external destinations"));
+        assert!(ssrf.contains("Outbound server-side network access was not established"));
+        assert!(
+            manual_guidance(&["SsrfBehavior".into()])
+                .join(" ")
+                .contains("authorized callback service")
+        );
         for category in [
             "UrlHandling",
             "FileOrPathHandling",

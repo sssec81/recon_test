@@ -1,0 +1,68 @@
+# This manifest is intentionally non-executable. Replace every REQUIRED value
+# from the program's published policy or written authorization before deriving
+# a command. Do not run while status is blocked_pending_authorization.
+status: blocked_pending_authorization
+
+authorization:
+  program_name: REQUIRED
+  policy_url: REQUIRED
+  written_authorization_reference: REQUIRED
+  authorization_checked_at: REQUIRED_ISO_8601
+  operator_identity: REQUIRED
+  security_contact: REQUIRED
+  automation_permitted: REQUIRED_TRUE
+  active_get_payloads_permitted: REQUIRED_TRUE
+  descendants_of_scope_root_permitted: REQUIRED_TRUE
+  minimum_allowed_per_host_rate_rps: REQUIRED_AT_LEAST_5
+  excluded_assets: REQUIRED
+  excluded_test_types: REQUIRED
+
+target:
+  # Use one hostname only. Do not include a scheme, path, wildcard, or file.
+  hostname: REQUIRED_AUTHORIZED_HOSTNAME
+  # ScopePolicy includes this hostname and every descendant. Use the narrowest
+  # authorized hostname and do not proceed unless descendants are authorized.
+  scope_root: REQUIRED_AUTHORIZED_SCOPE_ROOT
+
+limits:
+  duration_minutes: 12
+  concurrency: 1
+  max_targets: 1
+  passive_discovery: false
+  scheme_strategy: https-only
+  triage_max_pages: 25
+  triage_max_depth: 1
+  triage_max_requests: 75
+  triage_delay_ms: 1000
+  verification_max_opportunities: 3
+  verification_requests_per_opportunity: 2
+  sqli_max_parameters: 2
+  sqli_requests_per_parameter: 6
+  web_verification_max_candidates: 2
+  review_max_candidates: 5
+  review_min_score: 30
+  maximum_target_http_contacts: 129
+
+features:
+  triage: true
+  controlled_verification: true
+  sqli_verification: true
+  xss_verification: true
+  redirect_verification: true
+  traversal_verification: true
+  cors_verification: true
+  ssrf_verification: true
+  ai_analysis: false
+  diff_last: false
+
+stop_conditions:
+  - Any complaint, rate-limit response, service instability, or program request
+  - Any evidence that the hostname or a redirect destination is not authorized
+  - Any authentication boundary, state-changing workflow, or sensitive data
+  - More than 2 consecutive HTTP 429 or 503 responses
+  - The 12-minute deadline or the 129-contact ceiling
+
+output:
+  directory: evaluation/live-trial/runs/REQUIRED_TIMESTAMP
+  retain_full_response_bodies: false
+  manual_validation_required: true

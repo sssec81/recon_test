@@ -1,0 +1,127 @@
+🚀 Starting Async Recon Engine v1.0.0...
+✅ Database WAL writer connected to 'evaluation/positive-controls/run1/recon_data.db'
+🆔 Initialized ScanRun session: 341f2291-75fd-414e-9737-7b34b2f4ad29
+🔎 Scheduler queued 1 total in-scope target(s) for scanning [Strategy: BothParallel]...
+  [200] http://127.0.0.1:8000                            | RTT: Some(1)ms | Server: ReconPositiveControls/1.0 Python/3.14.4 | Title: Positive Controls
+  [ERR] https://127.0.0.1:8000                           | RTT: Nonems | Server: Unknown | Title: No Title
+📋 Triage review queue: 0 finding(s), 0 suppressed; saved to 'evaluation/positive-controls/run1/artifacts/341f2291-75fd-414e-9737-7b34b2f4ad29'
+
+🔬 Phase 3 controlled-verification review (manual validation required)
+  [10] UrlHandling — http://127.0.0.1:8000/fetch — Repeatable
+      Evidence: parameter `url` classified Url
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [10] FileOrPathHandling — http://127.0.0.1:8000/view — Repeatable
+      Evidence: parameter `file` classified File
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [8] SearchSurface — http://127.0.0.1:8000/xss — ControlVerified
+      Evidence: parameter `q` classified Search
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  0 opportunity/opportunities retained with a suppression reason.
+
+🧪 Phase 9A SQL-injection investigation: 3 parameter(s) checked, 0 candidate(s) retained
+
+🧪 Phase 9B reflected-XSS investigation: 3 checked, 1 retained
+
+🧪 Phase 9C open-redirect investigation: 1 checked, 0 retained
+
+🧪 Phase 9D traversal investigation: 1 checked, 1 retained
+
+🧪 Phase 9E CORS investigation: 7 checked, 1 retained
+
+🧪 Phase 9F SSRF investigation: 1 checked, 1 retained
+
+==================================================
+TOP INVESTIGATION CANDIDATES
+==================================================
+
+#1
+Endpoint: http://127.0.0.1:8000/view
+Investigation score: 63 / 100
+Evidence state: ControlVerified
+Categories: FileOrPathHandling, PathTraversalBehavior
+Endpoint context: Unknown
+Parameters: file → File
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +30 strongest evidence state is ControlVerified
+  +10 confirmed-live endpoint
+  +7 file or path parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review file and path handling manually within program rules.
+Review guidance: Review the repeated file-signature differential manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#2
+Endpoint: http://127.0.0.1:8000/xss
+Investigation score: 59 / 100
+Evidence state: ControlVerified
+Categories: ReflectedXssBehavior, SearchSurface
+Endpoint context: Unknown
+Parameters: q → Search
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +30 strongest evidence state is ControlVerified
+  +10 confirmed-live endpoint
+  +3 search or query parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Review guidance: Review the unescaped reflection context manually; script execution was not attempted.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#3
+Endpoint: http://127.0.0.1:8000/fetch
+Investigation score: 54 / 100
+Evidence state: Repeatable
+Categories: SsrfBehavior, UrlHandling
+Endpoint context: Unknown
+Parameters: url → Url
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +8 URL or redirect parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Review guidance: Review the reserved/loopback fetch differential manually; outbound access was not confirmed.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#4
+Endpoint: http://127.0.0.1:8000/account
+Investigation score: 39 / 100
+Evidence state: ControlVerified
+Categories: CorsBehavior
+Endpoint context: Account
+Parameters:
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +3 Account endpoint context
+  +30 strongest evidence state is ControlVerified
+  +6 crawl-derived code evidence family
+Review guidance: Review credentialed hostile-Origin behavior and affected data manually.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+📋 Human Review Package
+
+Ranked candidates: 4
+ControlVerified: 3
+Repeatable: 1
+
+Markdown:
+evaluation/positive-controls/run1/artifacts/review_report.md
+
+JSON:
+evaluation/positive-controls/run1/artifacts/review_report.json
+
+Manual validation is required before treating any candidate as a vulnerability.
+🎉 ScanRun 341f2291-75fd-414e-9737-7b34b2f4ad29 completed successfully!
+💾 Exported 9 observation(s) from ScanRun 341f2291-75fd-414e-9737-7b34b2f4ad29 to JSON: 'evaluation/positive-controls/run1/http_observations.json'
