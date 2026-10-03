@@ -1,0 +1,152 @@
+🚀 Starting Async Recon Engine v1.0.0...
+✅ Database WAL writer connected to 'evaluation/benign/run1/recon_data.db'
+🆔 Initialized ScanRun session: 614b51e5-2dd4-47cd-8046-145c3752d5eb
+🔎 Scheduler queued 1 total in-scope target(s) for scanning [Strategy: BothParallel]...
+  [200] http://127.0.0.1:8000                            | RTT: Some(2)ms | Server: BenignControl/1.0 Python/3.14.4 | Title: Benign Control
+  [ERR] https://127.0.0.1:8000                           | RTT: Nonems | Server: Unknown | Title: No Title
+📋 Triage review queue: 0 finding(s), 0 suppressed; saved to 'evaluation/benign/run1/artifacts/614b51e5-2dd4-47cd-8046-145c3752d5eb'
+
+🔬 Phase 3 controlled-verification review (manual validation required)
+  [11] AdministrativeSurface — http://127.0.0.1:8000/admin — Repeatable
+      Evidence: endpoint class `Admin`
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [11] AuthenticationSurface — http://127.0.0.1:8000/login — Repeatable
+      Evidence: endpoint class `Authentication`
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [10] UrlHandling — http://127.0.0.1:8000/api/profile — Repeatable
+      Evidence: parameter `url` classified Url
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [10] FileOrPathHandling — http://127.0.0.1:8000/files/view — Repeatable
+      Evidence: parameter `path` classified Path
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [8] SearchSurface — http://127.0.0.1:8000/rest/products/search — ControlVerified
+      Evidence: parameter `q` classified Search
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  1 opportunity/opportunities retained with a suppression reason.
+
+🧪 Phase 9A SQL-injection investigation: 3 parameter(s) checked, 0 candidate(s) retained
+
+🧪 Phase 9B reflected-XSS investigation: 3 checked, 0 retained
+
+🧪 Phase 9C open-redirect investigation: 2 checked, 0 retained
+
+🧪 Phase 9D traversal investigation: 1 checked, 0 retained
+
+🧪 Phase 9E CORS investigation: 9 checked, 0 retained
+
+🧪 Phase 9F SSRF investigation: 1 checked, 0 retained
+
+==================================================
+TOP INVESTIGATION CANDIDATES
+==================================================
+
+#1
+Endpoint: http://127.0.0.1:8000/rest/products/search
+Investigation score: 59 / 100
+Evidence state: ControlVerified
+Categories: SearchSurface
+Endpoint context: Search
+Parameters: q → Search
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +30 strongest evidence state is ControlVerified
+  +10 confirmed-live endpoint
+  +3 search or query parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#2
+Endpoint: http://127.0.0.1:8000/api/profile
+Investigation score: 54 / 100
+Evidence state: Repeatable
+Categories: UrlHandling
+Endpoint context: Api, UserProfile
+Parameters: url → Url
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +8 URL or redirect parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#3
+Endpoint: http://127.0.0.1:8000/files/view
+Investigation score: 53 / 100
+Evidence state: Repeatable
+Categories: FileOrPathHandling
+Endpoint context: Document
+Parameters: path → Path
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +7 file or path parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review file and path handling manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#4
+Endpoint: http://127.0.0.1:8000/admin
+Investigation score: 50 / 100
+Evidence state: Repeatable
+Categories: AdministrativeSurface
+Endpoint context: Admin
+Parameters:
+Evidence: page_or_script, triage_fetch, triage_link
+Why ranked:
+  +5 complete response fingerprint
+  +4 Admin endpoint context
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#5
+Endpoint: http://127.0.0.1:8000/login
+Investigation score: 49 / 100
+Evidence state: Repeatable
+Categories: AuthenticationSurface
+Endpoint context: Authentication
+Parameters:
+Evidence: page_or_script, triage_fetch, triage_link
+Why ranked:
+  +5 complete response fingerprint
+  +3 Authentication endpoint context
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review authentication and session behavior manually.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+📋 Human Review Package
+
+Ranked candidates: 5
+ControlVerified: 1
+Repeatable: 4
+
+Markdown:
+evaluation/benign/run1/artifacts/review_report.md
+
+JSON:
+evaluation/benign/run1/artifacts/review_report.json
+
+Manual validation is required before treating any candidate as a vulnerability.
+🎉 ScanRun 614b51e5-2dd4-47cd-8046-145c3752d5eb completed successfully!
+💾 Exported 11 observation(s) from ScanRun 614b51e5-2dd4-47cd-8046-145c3752d5eb to JSON: 'evaluation/benign/run1/http_observations.json'

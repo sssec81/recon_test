@@ -1,0 +1,126 @@
+🚀 Starting Async Recon Engine v1.0.0...
+✅ Database WAL writer connected to 'evaluation/juice-shop-stage1/repeat/recon_data.db'
+🆔 Initialized ScanRun session: 28d94c7f-3ba7-48a1-b070-2dffbb3b66ff
+🔎 Scheduler queued 1 total in-scope target(s) for scanning [Strategy: BothParallel]...
+  [200] http://127.0.0.1:8080                            | RTT: Some(4)ms | Server: Unknown | Title: OWASP Juice Shop
+  [ERR] https://127.0.0.1:8080                           | RTT: Nonems | Server: Unknown | Title: No Title
+  [triage] crawled 25 page(s), 28 request(s), 0 candidate(s)
+  [triage] crawled 50 page(s), 53 request(s), 0 candidate(s)
+📋 Triage review queue: 0 finding(s), 0 suppressed; saved to 'evaluation/juice-shop-stage1/repeat/artifacts/28d94c7f-3ba7-48a1-b070-2dffbb3b66ff'
+
+🔬 Phase 3 controlled-verification review (manual validation required)
+  [11] AdministrativeSurface — http://127.0.0.1:8080/rest/admin — Repeatable
+      Evidence: endpoint class `Admin`
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  [11] AuthenticationSurface — http://127.0.0.1:8080/rest/user/login — Repeatable
+      Evidence: endpoint class `Authentication`
+      Interpretation: behavior is an investigation candidate; no vulnerability is claimed.
+  5 opportunity/opportunities retained with a suppression reason.
+
+🧪 Phase 9A SQL-injection investigation: 4 parameter(s) checked, 1 candidate(s) retained
+
+🧪 Phase 9B reflected-XSS investigation: 4 checked, 0 retained
+
+🧪 Phase 9C open-redirect investigation: 1 checked, 1 retained
+
+🧪 Phase 9D traversal investigation: 0 checked, 0 retained
+
+🧪 Phase 9E CORS investigation: 10 checked, 0 retained
+
+🧪 Phase 9F SSRF investigation: 0 checked, 0 retained
+
+==================================================
+TOP INVESTIGATION CANDIDATES
+==================================================
+
+#1
+Endpoint: http://127.0.0.1:8080/rest/products/search
+Investigation score: 59 / 100
+Evidence state: ControlVerified
+Categories: SearchSurface, SqlInjectionBehavior
+Endpoint context: Search
+Parameters: q → Search
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +30 strongest evidence state is ControlVerified
+  +10 confirmed-live endpoint
+  +3 search or query parameter semantic
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Review guidance: Review the repeatable database-error differential manually; SQL injection is not confirmed.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#2
+Endpoint: http://127.0.0.1:8080/redirect
+Investigation score: 51 / 100
+Evidence state: ControlVerified
+Categories: OpenRedirectBehavior, RedirectBehavior
+Endpoint context: Redirect
+Parameters: to → Unknown
+Evidence: javascript, javascript_call, triage_fetch, triage_script, verification
+Why ranked:
+  +30 strongest evidence state is ControlVerified
+  +10 confirmed-live endpoint
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Inspect destination validation manually within program rules.
+Review guidance: Review the blocked external Location response manually; no out-of-scope destination was contacted.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#3
+Endpoint: http://127.0.0.1:8080/rest/admin
+Investigation score: 50 / 100
+Evidence state: Repeatable
+Categories: AdministrativeSurface
+Endpoint context: Admin
+Parameters:
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +4 Admin endpoint context
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review the correlated behavior manually within program rules.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+#4
+Endpoint: http://127.0.0.1:8080/rest/user/login
+Investigation score: 49 / 100
+Evidence state: Repeatable
+Categories: AuthenticationSurface
+Endpoint context: Authentication, UserProfile
+Parameters:
+Evidence: javascript, javascript_call, triage_fetch, triage_script
+Why ranked:
+  +5 complete response fingerprint
+  +3 Authentication endpoint context
+  +20 strongest evidence state is Repeatable
+  +10 confirmed-live endpoint
+  +6 crawl-derived code evidence family
+  +5 live HTTP evidence family
+Review guidance: Review authentication and session behavior manually.
+Manual validation: REQUIRED
+Scanner conclusion: Investigation candidate only. No vulnerability is confirmed.
+
+📋 Human Review Package
+
+Ranked candidates: 4
+ControlVerified: 2
+Repeatable: 2
+
+Markdown:
+evaluation/juice-shop-stage1/repeat/artifacts/review_report.md
+
+JSON:
+evaluation/juice-shop-stage1/repeat/artifacts/review_report.json
+
+Manual validation is required before treating any candidate as a vulnerability.
+🎉 ScanRun 28d94c7f-3ba7-48a1-b070-2dffbb3b66ff completed successfully!
+💾 Exported 55 observation(s) from ScanRun 28d94c7f-3ba7-48a1-b070-2dffbb3b66ff to JSON: 'evaluation/juice-shop-stage1/repeat/http_observations.json'

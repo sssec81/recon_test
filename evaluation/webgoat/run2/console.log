@@ -1,0 +1,42 @@
+🚀 Starting Async Recon Engine v1.0.0...
+✅ Database WAL writer connected to 'evaluation/webgoat/run2/recon_data.db'
+🆔 Initialized ScanRun session: d633b41e-9298-42f6-82a6-407b72b03e68
+🔎 Scheduler queued 1 total in-scope target(s) for scanning [Strategy: BothParallel]...
+  [404] http://127.0.0.1:8080                            | RTT: Some(2)ms | Server: Unknown | Title: HTTP Status 404 – Not Found
+  [ERR] https://127.0.0.1:8080                           | RTT: Nonems | Server: Unknown | Title: No Title
+📋 Triage review queue: 0 finding(s), 0 suppressed; saved to 'evaluation/webgoat/run2/artifacts/d633b41e-9298-42f6-82a6-407b72b03e68'
+
+🔬 Phase 3 controlled-verification review (manual validation required)
+  No Phase 3 candidates survived repeat/control suppression.
+  0 opportunity/opportunities retained with a suppression reason.
+
+🧪 Phase 9A SQL-injection investigation: 0 parameter(s) checked, 0 candidate(s) retained
+
+🧪 Phase 9B reflected-XSS investigation: 0 checked, 0 retained
+
+🧪 Phase 9C open-redirect investigation: 0 checked, 0 retained
+
+🧪 Phase 9D traversal investigation: 0 checked, 0 retained
+
+🧪 Phase 9E CORS investigation: 1 checked, 0 retained
+
+🧪 Phase 9F SSRF investigation: 0 checked, 0 retained
+
+==================================================
+TOP INVESTIGATION CANDIDATES
+==================================================
+No candidates met the deterministic review threshold.
+
+📋 Human Review Package
+
+Ranked candidates: 0
+
+Markdown:
+evaluation/webgoat/run2/artifacts/review_report.md
+
+JSON:
+evaluation/webgoat/run2/artifacts/review_report.json
+
+Manual validation is required before treating any candidate as a vulnerability.
+🎉 ScanRun d633b41e-9298-42f6-82a6-407b72b03e68 completed successfully!
+💾 Exported 2 observation(s) from ScanRun d633b41e-9298-42f6-82a6-407b72b03e68 to JSON: 'evaluation/webgoat/run2/http_observations.json'
